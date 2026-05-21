@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "cicd-agent"
+version = "0.1.0"
+description = "Production-grade CI/CD intelligence agent using Gemini + GitHub MCP"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "test_local.py"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

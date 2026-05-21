@@ -1,0 +1,12 @@
+##[group]Run pytest tests/
+##[command]pytest tests/ -v
+collecting ...
+collected 3 items
+
+tests/test_auth.py::test_login PASSED
+tests/test_auth.py::test_logout PASSED
+tests/test_math.py::test_divide FAILED
+
+FAILED tests/test_math.py::test_divide - ZeroDivisionError: division by zero
+
+##[error]Process completed with exit code 1.

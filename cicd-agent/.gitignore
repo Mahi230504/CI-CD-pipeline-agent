@@ -1,0 +1,32 @@
+# Environment — never commit
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Run registry (contains run metadata, not for git)
+run_registry.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
