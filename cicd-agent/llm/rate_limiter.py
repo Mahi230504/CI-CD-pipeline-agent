@@ -42,6 +42,14 @@ class DailyLimitReachedError(Exception):
     pass
 
 
+class DailyCostCapReachedError(DailyLimitReachedError):
+    """Raised when the day's cumulative Gemini cost would exceed the configured cap.
+
+    Inherits from DailyLimitReachedError so the agents' existing
+    `except DailyLimitReachedError` handlers catch this without code changes.
+    """
+
+
 @dataclass
 class RateLimiterStats:
     requests_today: int = 0
@@ -88,12 +96,15 @@ class RateLimiterStats:
         return time.monotonic() - self.last_call_at
 
 
-_RATE_LIMIT_TYPE_KEYWORDS = ("ratelimit", "resourceexhausted", "quotaexceeded")
+_RATE_LIMIT_TYPE_KEYWORDS = ("ratelimit", "resourceexhausted", "quotaexceeded", "unavailable")
 _RATE_LIMIT_MESSAGE_KEYWORDS = (
     "rate limit",
     "quota exceeded",
     "resource exhausted",
     "too many requests",
+    "unavailable",
+    "currently experiencing high demand",
+    "503",
 )
 
 
@@ -102,7 +113,7 @@ def _is_rate_limit_error(e: Exception) -> bool:
     if any(k in type_name for k in _RATE_LIMIT_TYPE_KEYWORDS):
         return True
     raw = str(e)
-    if "429" in raw:
+    if "429" in raw or "503" in raw:
         return True
     lower = raw.lower()
     return any(k in lower for k in _RATE_LIMIT_MESSAGE_KEYWORDS)
@@ -132,6 +143,20 @@ class GeminiRateLimiter:
             raise DailyLimitReachedError(
                 f"Daily Gemini request limit of {DAILY_REQUEST_LIMIT} reached"
             )
+
+        # Daily $ cost cap — checked at call time so the next ATTEMPTED call
+        # short-circuits, not the previous one. Cost is updated *after* each
+        # successful call in gemini_client.record_gemini_call().
+        from config.settings import get_settings
+        from metrics import cost_total_today
+
+        cap = float(get_settings().daily_cost_cap_dollars or 0.0)
+        if cap > 0:
+            spent = cost_total_today()
+            if spent >= cap:
+                raise DailyCostCapReachedError(
+                    f"Daily cost cap reached: ${spent:.4f} / ${cap:.4f}"
+                )
 
         async with self._semaphore:
             await self._wait_for_min_delay()

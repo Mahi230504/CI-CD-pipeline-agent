@@ -39,6 +39,12 @@ class Settings:
     slack_webhook_url: str | None = None
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
+    daily_cost_cap_dollars: float = 1.0
+    cost_cap_warn_pct: float = 0.8
+    # Path for the persistent webhook outbox + task-queue replay store.
+    queue_db_path: str = "./queue.sqlite3"
+    # Path for the JSON run registry (dedup + attempt counting).
+    run_registry_path: str = "./run_registry.json"
 
     @property
     def github_mcp_url(self) -> str:
@@ -46,7 +52,10 @@ class Settings:
 
     @property
     def github_mcp_headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.github_pat}"}
+        return {
+            "Authorization": f"Bearer {self.github_pat}",
+            "X-MCP-Toolsets": "all",
+        }
 
     @property
     def log_dir_path(self) -> Path:
@@ -131,6 +140,10 @@ def get_settings() -> Settings:
         slack_webhook_url=_optional_or_none("SLACK_WEBHOOK_URL"),
         telegram_bot_token=_optional_or_none("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_optional_or_none("TELEGRAM_CHAT_ID"),
+        daily_cost_cap_dollars=_float_env("DAILY_COST_CAP_DOLLARS", 1.0),
+        cost_cap_warn_pct=_float_env("COST_CAP_WARN_PCT", 0.8),
+        queue_db_path=_optional("QUEUE_DB_PATH", "./queue.sqlite3"),
+        run_registry_path=_optional("RUN_REGISTRY_PATH", "./run_registry.json"),
     )
     print(
         f"⚙ Settings loaded: repo={settings.full_repo_name}, "

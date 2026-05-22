@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any
 
 from google import genai
@@ -29,8 +30,22 @@ from llm.rate_limiter import (
     GeminiRateLimitError,
     rate_limited_call,
 )
+from metrics import record_gemini_call
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_token_counts(response: Any) -> tuple[int, int]:
+    """Pull (input_tokens, output_tokens) out of a Gemini response if available."""
+    meta = getattr(response, "usage_metadata", None)
+    if meta is None:
+        return 0, 0
+    inp = getattr(meta, "prompt_token_count", 0) or 0
+    out = getattr(meta, "candidates_token_count", 0) or 0
+    try:
+        return int(inp), int(out)
+    except (TypeError, ValueError):
+        return 0, 0
 
 
 _AWS_KEY_PATTERN = re.compile(r"AKIA[0-9A-Z]{16}")
@@ -109,6 +124,7 @@ class GeminiClient:
                 config=config,
             )
 
+        started = time.monotonic()
         try:
             response = await rate_limited_call(_call)
         except (GeminiError, GeminiRateLimitError, DailyLimitReachedError):
@@ -116,6 +132,13 @@ class GeminiClient:
         except Exception as e:
             raise GeminiError(f"{agent}: {e}", agent=agent, original=e) from e
 
+        duration = time.monotonic() - started
+        in_toks, out_toks = _extract_token_counts(response)
+        cost = record_gemini_call(model, duration, in_toks, out_toks)
+        logger.info(
+            "gemini: agent=%s model=%s dur=%.2fs in=%d out=%d cost=$%.5f",
+            agent, model, duration, in_toks, out_toks, cost,
+        )
         return _validate_response(response, agent)
 
     async def generate_with_tools(
@@ -143,6 +166,7 @@ class GeminiClient:
                 config=config,
             )
 
+        started = time.monotonic()
         try:
             response = await rate_limited_call(_call)
         except (GeminiError, GeminiRateLimitError, DailyLimitReachedError):
@@ -150,22 +174,35 @@ class GeminiClient:
         except Exception as e:
             raise GeminiError(f"{agent}: {e}", agent=agent, original=e) from e
 
+        duration = time.monotonic() - started
+        in_toks, out_toks = _extract_token_counts(response)
+        record_gemini_call(self._primary_model, duration, in_toks, out_toks)
         return _validate_response(response, agent)
 
     async def ping(self) -> bool:
-        try:
-            response = await self._client.aio.models.generate_content(
-                model=self._light_model,
-                contents="Reply with just the word OK.",
-                config=types.GenerateContentConfig(temperature=0.0),
-            )
-            text = getattr(response, "text", "") or ""
-            ok = bool(text.strip())
-            logger.info("gemini ping: %s", "ok" if ok else "empty response")
-            return ok
-        except Exception as e:
-            logger.warning("gemini ping failed: %s", e)
-            return False
+        import asyncio as _asyncio
+        last_exc: Exception | None = None
+        # Use primary model — light model has tighter daily quota on free tier.
+        for attempt in (1, 2, 3):
+            try:
+                response = await self._client.aio.models.generate_content(
+                    model=self._primary_model,
+                    contents="Reply with just the word OK.",
+                    config=types.GenerateContentConfig(temperature=0.0),
+                )
+                text = getattr(response, "text", "") or ""
+                if text.strip():
+                    logger.info("gemini ping: ok (attempt %d)", attempt)
+                    return True
+                logger.warning("gemini ping: empty response (attempt %d)", attempt)
+            except Exception as e:
+                last_exc = e
+                logger.warning("gemini ping failed (attempt %d): %s", attempt, e)
+            if attempt < 3:
+                await _asyncio.sleep(2 * attempt)
+        if last_exc is not None:
+            logger.warning("gemini ping: giving up after 3 attempts: %s", last_exc)
+        return False
 
 
 _gemini_client: GeminiClient | None = None

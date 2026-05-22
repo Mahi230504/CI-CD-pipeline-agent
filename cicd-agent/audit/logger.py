@@ -167,6 +167,10 @@ def get_audit_logger() -> AuditLogger:
 
 @asynccontextmanager
 async def audit_step(run_id: int | str, step: Any, **metadata: Any):
+    from audit.context import set_run_context  # local import: audit/context imports nothing
+
+    step_name = _step_value(step)
+    set_run_context(phase=step_name)
     started = time.monotonic()
     try:
         yield

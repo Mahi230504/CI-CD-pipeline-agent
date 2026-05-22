@@ -29,6 +29,15 @@ class ErrorType(StrEnum):
     FLAKY = "flaky"
     UNKNOWN = "unknown"
 
+    @classmethod
+    def coerce(cls, value: object) -> "ErrorType":
+        if not isinstance(value, str) or not value.strip():
+            return cls.UNKNOWN
+        try:
+            return cls(value.strip().lower())
+        except ValueError:
+            return cls.UNKNOWN
+
 
 class TaskState(StrEnum):
     IDLE = "idle"
@@ -95,6 +104,8 @@ INFRA_ERROR_KEYWORDS: Final[list[str]] = [
     "docker pull failed",
     "manifest unknown",
     "i/o timeout",
+    "network timeout",
+    "network is unreachable",
     "connection reset by peer",
     "connection timed out",
     "could not resolve host",
@@ -119,5 +130,11 @@ IGNORED_ACTOR_PATTERNS: Final[list[str]] = [
 
 PATCH_BRANCH_PREFIX: Final[str] = "agent/fix"
 OPTIMIZE_BRANCH_PREFIX: Final[str] = "agent/optimize"
+# Single rolling branch — all auto-fixes land here as separate commits until the
+# associated PR is merged or closed. Replaces per-run agent/fix-{run_id} branches.
+ROLLING_PATCH_BRANCH: Final[str] = "agent/fixes"
+# Commit-message prefix the demo workflow filters on to avoid CI re-running on
+# agent's own commits.
+AGENT_FIX_COMMIT_TAG: Final[str] = "[agent-fix]"
 MAX_QUEUE_DEPTH: Final[int] = 10
 DEAD_LETTER_FILE: Final[str] = "dead_letter.jsonl"
