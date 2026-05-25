@@ -4,11 +4,13 @@ Code patcher agent — reads the failing file and generates a fix.
 Flow:
 1. Reads the failing file via github/mcp_client.get_file_contents()
 2. Checks BLOCKED_FILE_PATTERNS — hard stop if matched
-3. Sends file content + Diagnosis + CODE_PATCHER_PROMPT to Gemini
-4. Parses response through response_parser.parse_diff()
-5. Validates diff: must be valid unified diff, must not delete >50% of file
-6. Calls pr_manager to create branch, apply diff, commit, open PR
-7. Returns PatchResult with PR URL and attempt number
+3. Sends line-numbered file content + Diagnosis + CODE_PATCHER_PROMPT to Gemini
+4. Gemini returns the FULL corrected file in a fenced code block (or CANNOT_PATCH)
+5. We synthesize the unified diff locally with difflib.unified_diff — never trust
+   the LLM to count lines for hunk headers
+6. Validates: removal cap, blocked-file recheck, syntax check happen downstream
+7. Calls pr_manager to apply, commit, open/update PR
+8. Returns PatchResult with PR URL and attempt number
 
 Uses PRIMARY_MODEL (gemini-2.5-flash).
 Never touches main branch. Never patches secrets or config files.
@@ -16,8 +18,10 @@ Never touches main branch. Never patches secrets or config files.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
+import re
 from dataclasses import replace
 
 from config.prompts import CODE_PATCHER_SYSTEM_PROMPT
@@ -29,7 +33,6 @@ from llm.rate_limiter import (
     GeminiError,
     GeminiRateLimitError,
 )
-from llm.response_parser import parse_diff
 from models.events import WorkflowFailureEvent
 from models.run import Diagnosis, PatchResult
 
@@ -39,6 +42,56 @@ logger = logging.getLogger("cicd_agent.code_patcher")
 # (single-file limit pre-Phase-1) but generous enough for multi-file refactors
 # that the LLM might propose for a single failure.
 _MAX_REMOVAL_LINES = 30
+
+
+def _format_with_line_numbers(content: str) -> str:
+    lines = content.splitlines()
+    if not lines:
+        return ""
+    width = max(4, len(str(len(lines))))
+    return "\n".join(f"{i + 1:>{width}} | {line}" for i, line in enumerate(lines))
+
+
+_FENCE_RE = re.compile(r"```(?:[\w+-]*)\s*\n(.*?)```", re.DOTALL)
+
+
+def _extract_full_file(response_text: str) -> str | None:
+    """Pull the corrected file content from Gemini's response.
+
+    Accepts a fenced code block (any language tag) or, as a fallback, the entire
+    trimmed response if it contains no fence and no diff syntax. Returns None for
+    the CANNOT_PATCH refusal token or anything unparseable.
+    """
+    if not response_text:
+        return None
+    text = response_text.strip()
+    if "CANNOT_PATCH" in text:
+        return None
+
+    m = _FENCE_RE.search(response_text)
+    if m:
+        candidate = m.group(1).rstrip("\n")
+        return candidate if candidate.strip() else None
+
+    if text.startswith("---") or text.startswith("@@"):
+        return None
+    return text if text else None
+
+
+def _synthesize_diff(original: str, new_content: str, path: str) -> str:
+    """Build a unified diff that whatthepatch will apply cleanly."""
+    if original.endswith("\n") and not new_content.endswith("\n"):
+        new_content += "\n"
+    original_lines = original.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    diff_iter = difflib.unified_diff(
+        original_lines,
+        new_lines,
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        n=3,
+    )
+    return "".join(diff_iter)
 
 
 async def patch(
@@ -102,15 +155,18 @@ async def patch(
             "line_number": diagnosis.line_number,
         }
     )
+    numbered_content = _format_with_line_numbers(file_content)
     prompt = "\n".join(
         [
             f"File: {diagnosis.file}",
-            "--- FILE CONTENT ---",
-            file_content,
+            "--- FILE CONTENT (each line prefixed with `NNNN | `; the prefix is NOT part of the file) ---",
+            numbered_content,
             "--- DIAGNOSIS ---",
             diagnosis_summary,
             "--- END ---",
-            "Generate a unified diff to fix this bug.",
+            "Generate a unified diff to fix this bug. Use the prefixed line numbers to "
+            "compute correct `@@ -X,Y +A,B @@` hunk headers. Do NOT include the `NNNN | ` "
+            "prefix in any line of the diff itself.",
         ]
     )
 
@@ -138,13 +194,28 @@ async def patch(
             error_message=str(e),
         )
 
-    diff = parse_diff(response_text)
-    if diff is None:
+    new_content = _extract_full_file(response_text)
+    if new_content is None:
         return PatchResult(
             branch_name="",
             success=False,
             attempt_number=attempt_number,
-            error_message="Model signalled CANNOT_PATCH or diff unparseable",
+            error_message="Model signalled CANNOT_PATCH or response unparseable",
+        )
+    if new_content == file_content:
+        return PatchResult(
+            branch_name="",
+            success=False,
+            attempt_number=attempt_number,
+            error_message="Model returned file unchanged",
+        )
+    diff = _synthesize_diff(file_content, new_content, diagnosis.file)
+    if not diff.strip():
+        return PatchResult(
+            branch_name="",
+            success=False,
+            attempt_number=attempt_number,
+            error_message="Synthesized diff is empty",
         )
 
     removal_count = sum(

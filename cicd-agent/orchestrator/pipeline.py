@@ -177,7 +177,7 @@ async def _execute_pipeline(
         from agents.log_analyst import diagnose
         async with audit_step(event.run_id, PipelineStep.LOG_ANALYSIS):
             task.set_state(TaskState.DIAGNOSING)
-            diagnosis = await diagnose(job_logs, event)
+            diagnosis = await diagnose(job_logs, event, mcp_client=mcp)
             task.diagnosis = diagnosis
             task.mark_step_done(PipelineStep.LOG_ANALYSIS)
 

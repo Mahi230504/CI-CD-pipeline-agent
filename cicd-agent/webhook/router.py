@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 
-from config.constants import IGNORED_ACTOR_PATTERNS
+from config.constants import AGENT_BRANCH_PREFIX, IGNORED_ACTOR_PATTERNS
 from models.events import WebhookPayload, WorkflowFailureEvent
 from orchestrator.task_queue import enqueue_event
 
@@ -39,6 +39,9 @@ async def route_webhook(body: bytes, github_event: str) -> tuple[bool, str]:
 
     if payload.conclusion != "failure":
         return False, f"Ignored conclusion: {payload.conclusion}"
+
+    if payload.branch.startswith(AGENT_BRANCH_PREFIX):
+        return False, f"Ignored agent branch: {payload.branch}"
 
     ignored_lower = {a.lower() for a in IGNORED_ACTOR_PATTERNS}
     if payload.sender_login.lower() in ignored_lower:

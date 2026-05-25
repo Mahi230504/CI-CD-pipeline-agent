@@ -137,6 +137,10 @@ OPTIMIZE_BRANCH_PREFIX: Final[str] = "agent/optimize"
 # Single rolling branch — all auto-fixes land here as separate commits until the
 # associated PR is merged or closed. Replaces per-run agent/fix-{run_id} branches.
 ROLLING_PATCH_BRANCH: Final[str] = "agent/fixes"
+# All agent-created branches share this prefix. The router drops workflow_run
+# events from these branches so the agent does not self-trigger on CI for its
+# own PRs.
+AGENT_BRANCH_PREFIX: Final[str] = "agent/"
 # Commit-message prefix the demo workflow filters on to avoid CI re-running on
 # agent's own commits.
 AGENT_FIX_COMMIT_TAG: Final[str] = "[agent-fix]"
