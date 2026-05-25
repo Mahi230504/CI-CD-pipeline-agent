@@ -51,12 +51,41 @@ async def get_last_n_runs(
 
 
 def compute_pass_rate(runs: list[dict]) -> float:
+    """Pass rate over runs that actually finished. `skipped` / `cancelled` /
+    `neutral` runs are excluded from both numerator and denominator — they
+    carry no signal about whether the workflow is stable.
+
+    Returns 0.0 if no runs finished with a real verdict (so the caller can
+    distinguish "no signal" from "always failing")."""
     if not runs:
         return 0.0
-    successes = sum(
-        1 for r in runs if isinstance(r, dict) and r.get("conclusion") == "success"
-    )
-    return successes / len(runs)
+    decisive: list[dict] = []
+    for r in runs:
+        if not isinstance(r, dict):
+            continue
+        conclusion = r.get("conclusion")
+        if conclusion in ("success", "failure"):
+            decisive.append(r)
+    if not decisive:
+        return 0.0
+    successes = sum(1 for r in decisive if r.get("conclusion") == "success")
+    return successes / len(decisive)
+
+
+def had_success_at_sha(runs: list[dict], head_sha: str) -> bool:
+    """Did any of the supplied runs succeed at exactly this head_sha?
+    A clean "yes" is the canonical signal for genuine flakiness: same code,
+    sometimes passes, sometimes fails."""
+    if not head_sha:
+        return False
+    for r in runs:
+        if (
+            isinstance(r, dict)
+            and r.get("conclusion") == "success"
+            and r.get("head_sha") == head_sha
+        ):
+            return True
+    return False
 
 
 async def get_workflow_yaml_files(mcp_client: GitHubMCPClient) -> dict[str, str]:

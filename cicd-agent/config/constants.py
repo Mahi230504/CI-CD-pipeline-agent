@@ -92,7 +92,11 @@ BLOCKED_FILE_PATTERNS: Final[list[str]] = [
 
 LOG_SLICE_WINDOW: Final[int] = 30
 MAX_LOG_CHARS: Final[int] = 32_000
-FLAKINESS_THRESHOLD: Final[float] = 0.4
+# A run is "flaky" only when the workflow is normally green AND today's failure
+# is the odd one out. Threshold is the pass rate of recent *decisive* runs
+# (skipped/cancelled excluded). 0.85 means: "if at least 85% of recent runs
+# passed and now we fail, it's suspicious and likely transient."
+FLAKINESS_THRESHOLD: Final[float] = 0.85
 FLAKINESS_LOOKBACK: Final[int] = 5
 
 INFRA_ERROR_KEYWORDS: Final[list[str]] = [

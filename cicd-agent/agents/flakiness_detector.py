@@ -30,7 +30,7 @@ from config.constants import (
 )
 from github.log_fetcher import has_infra_error
 from github.mcp_client import GitHubMCPClient
-from github.run_history import compute_pass_rate, get_last_n_runs
+from github.run_history import compute_pass_rate, get_last_n_runs, had_success_at_sha
 from models.events import WorkflowFailureEvent
 from models.run import JobLog
 from models.task import FlakinessVerdict
@@ -83,20 +83,41 @@ async def check(
                 )
 
         runs = await get_last_n_runs(event.workflow_name, FLAKINESS_LOOKBACK, mcp_client)
-        pass_rate = compute_pass_rate(runs)
-        if pass_rate >= FLAKINESS_THRESHOLD:
-            logger.info("flakiness_check: pass_rate=%.2f → flaky", pass_rate)
+
+        # Strongest signal: the SAME head_sha succeeded in a previous run.
+        # Code didn't change, outcome differs → genuine flakiness.
+        if had_success_at_sha(runs, event.head_sha):
+            logger.info("flakiness_check: same head_sha %s passed previously → flaky",
+                        event.head_sha[:8])
             return FlakinessVerdict(
                 is_flaky=True,
-                reason=f"Passed {pass_rate:.0%} of last {FLAKINESS_LOOKBACK} runs",
+                reason=f"Same commit {event.head_sha[:8]} passed in a prior run",
+                pass_rate=1.0,
+                error_category=ErrorCategory.FLAKY_TEST,
+            )
+
+        pass_rate = compute_pass_rate(runs)
+        # Today's failure looks flaky only if the workflow is otherwise reliably
+        # green. Below the threshold it's either a real regression or part of an
+        # ongoing broken streak — either way, the agent should try to patch.
+        if pass_rate >= FLAKINESS_THRESHOLD:
+            logger.info("flakiness_check: pass_rate=%.2f ≥ %.2f → flaky", pass_rate,
+                        FLAKINESS_THRESHOLD)
+            return FlakinessVerdict(
+                is_flaky=True,
+                reason=(
+                    f"Workflow normally green ({pass_rate:.0%} pass rate over recent "
+                    f"decisive runs); today's failure looks transient"
+                ),
                 pass_rate=pass_rate,
                 error_category=ErrorCategory.FLAKY_TEST,
             )
 
-        logger.info("flakiness_check: pass_rate=%.2f → real failure", pass_rate)
+        logger.info("flakiness_check: pass_rate=%.2f < %.2f → real failure", pass_rate,
+                    FLAKINESS_THRESHOLD)
         return FlakinessVerdict(
             is_flaky=False,
-            reason=f"Consistent failure: {pass_rate:.0%} pass rate",
+            reason=f"Recent pass rate {pass_rate:.0%} — treating as real failure",
             pass_rate=pass_rate,
             error_category=ErrorCategory.CODE_BUG,
         )

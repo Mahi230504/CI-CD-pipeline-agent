@@ -1,0 +1,8 @@
+{
+  "error_type": "test_failure",
+  "file": "tests/test_math.py",
+  "line_number": null,
+  "explanation": "ZeroDivisionError in test_divide: division by zero",
+  "confidence": 0.9,
+  "is_patchable": true
+}

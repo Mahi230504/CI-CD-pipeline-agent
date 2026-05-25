@@ -1,0 +1,66 @@
+# fly.toml — deployment manifest for the CI/CD intelligence agent.
+#
+# First-time setup:
+#   fly auth login
+#   fly launch --copy-config --no-deploy           # picks a unique app name + region
+#   fly volumes create agent_data --size 1 --region <region>
+#   fly secrets set \
+#     GEMINI_API_KEY=... \
+#     GITHUB_PERSONAL_ACCESS_TOKEN=... \
+#     GITHUB_WEBHOOK_SECRET=... \
+#     GITHUB_REPO_OWNER=Mahi230504 \
+#     GITHUB_REPO_NAME=cicd-agent-demo \
+#     TELEGRAM_BOT_TOKEN=... \
+#     TELEGRAM_CHAT_ID=...
+#   fly deploy
+#
+# After deploy, register the public URL as the GitHub webhook target:
+#   https://<your-app>.fly.dev/webhook
+
+app = "cicd-agent"
+primary_region = "iad"   # change to your nearest region; `fly platform regions`
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  WEBHOOK_PORT = "8000"
+  PRODUCTION_MODE = "true"
+  CICD_AGENT_LOG_FORMAT = "json"
+  LOG_DIR = "/data/logs"
+  QUEUE_DB_PATH = "/data/queue.sqlite3"
+  RUN_REGISTRY_PATH = "/data/run_registry.json"
+
+# Persistent volume — queue.sqlite3 + run_registry.json + logs/ survive deploys.
+[[mounts]]
+  source = "agent_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false      # never park: webhooks must hit a live process
+  auto_start_machines = false
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 50
+    soft_limit = 25
+
+  # /health is fast; /metrics + /status add no DB roundtrips either.
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
+  size = "shared-cpu-1x"
