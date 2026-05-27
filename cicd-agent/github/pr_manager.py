@@ -473,6 +473,17 @@ async def apply_patch_set(
     pr_number = pr.get("number") if isinstance(pr.get("number"), int) else None
     pr_url = pr.get("html_url") if isinstance(pr.get("html_url"), str) else None
 
+    # The MCP create_pull_request response doesn't reliably expose number/html_url
+    # at the top level (response shape varies). Fall back to REST so dedup
+    # (record_open_pr), labels, and the notification link all get a real PR number.
+    if pr_number is None or pr_url is None:
+        fresh = await rest_api.find_open_pr_by_head(ROLLING_PATCH_BRANCH)
+        if fresh is not None:
+            if pr_number is None and isinstance(fresh.get("number"), int):
+                pr_number = fresh["number"]
+            if pr_url is None and isinstance(fresh.get("html_url"), str):
+                pr_url = fresh["html_url"]
+
     # Best-effort labelling — failures don't fail the patch result.
     if isinstance(pr_number, int):
         risk = assess_risk(diagnosis, patch_set.paths)
