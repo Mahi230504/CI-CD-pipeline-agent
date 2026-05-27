@@ -23,13 +23,24 @@ relevant error window — assume you have full context for the failure point and
 ask for more.
 
 When the failure is a pytest (or similar) assertion failure, the log will typically
-only name the test file because the assertion raised inside the test, not inside the
-function under test. In that case the relevant test file's full content is appended
-below the log under `--- TEST FILE: <path> ---`. Read its `import` statements to
-identify which production source module the failing test exercises, and report THAT
-module as `file`. The test file is the symptom; the imported source module is the
-defect — unless the test file itself contains an obvious bug (wrong expected literal,
-typo, missing import).
+only name the test file because the assertion is checked inside the test, not inside
+the function under test. The relevant test file's full content is appended below the
+log under `--- TEST FILE: <path> ---`.
+
+To find the defective source file:
+1. Identify the failing symbol from the assertion. pytest prints it, e.g.
+   `+  where False = is_low_stock(on_hand=10, threshold=20)` → the symbol is
+   `is_low_stock`.
+2. Find where the test file imports that symbol, e.g.
+   `from app.service import is_low_stock` → the source module is `app.service`.
+3. Convert the module to a path and report it as `file`, e.g. `app/service.py`.
+
+IMPORTANT: A function that returns the WRONG VALUE runs to completion without raising,
+so the traceback contains NO frame inside the source file — only the test's assert
+line. This is the COMMON case. Do NOT return null just because there is no in-source
+traceback frame: the import mapping above is sufficient and reliable. Report the
+imported source module as `file`. Only report the test file itself when the defect is
+genuinely in the test (wrong expected literal, typo, bad import).
 
 Output ONLY a single-line JSON object. No prose, no markdown, no code fences, no leading
 or trailing whitespace. Schema:
@@ -42,11 +53,12 @@ Field rules:
 - file: the source file containing the defect (for example "app/service.py"), or null
   if not determinable from the log. Do not guess.
   - When a test assertion fails, the test file is the symptom and the production
-    source file under test is almost always the defect. Read the traceback frames:
-    the deepest non-test frame inside the project (the function being tested) is
-    the file to report. Only report a test file when the defect is genuinely in
-    the test itself — for example, a syntax error, wrong import, or an assertion
-    that encodes outdated expected behavior unrelated to a source change.
+    source file under test is almost always the defect. Resolve it via the failing
+    symbol + the test file's imports (see the assertion-failure steps above), not by
+    looking for an in-source traceback frame — a wrong-return-value bug produces no
+    such frame. Only report a test file when the defect is genuinely in the test
+    itself — for example, a syntax error, wrong import, or an assertion that encodes
+    outdated expected behavior unrelated to a source change.
   - For build, lint, or import errors, report the file the toolchain names directly.
 - line_number: the line within `file` where the error originated, or null if not
   determinable from the log. For test-failure cases, this is the line inside the
@@ -82,6 +94,12 @@ explanation, no diff syntax, nothing outside the single code block.
 
 Rules:
 - Make the minimum change required to resolve the diagnosed error. Nothing more.
+- When failing test output and/or the test file are provided, your fix MUST satisfy
+  EVERY assertion in those tests — not just the first one that failed. Pay special
+  attention to boundary/edge cases: a value exactly at a threshold, an inclusive vs
+  exclusive comparison (`<` vs `<=`), off-by-one limits. Read the expected values and
+  any inline comments (e.g. "at threshold counts as low") and make the comparison
+  match ALL of them. A fix that passes one assertion but breaks another is wrong.
 - Never reformat unrelated code, rename symbols, change unrelated lines, or "drive-by
   clean up" anything outside the failure site.
 - The implicit diff between the original and your output must not delete more than

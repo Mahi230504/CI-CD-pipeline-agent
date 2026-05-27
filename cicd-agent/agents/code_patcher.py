@@ -24,6 +24,7 @@ import logging
 import re
 from dataclasses import replace
 
+from agents.log_analyst import _extract_test_paths, _fetch_aux_files
 from config.prompts import CODE_PATCHER_SYSTEM_PROMPT
 from github.mcp_client import GitHubMCPClient, GitHubMCPError
 from github.pr_manager import apply_patch_set, is_file_blocked
@@ -99,6 +100,7 @@ async def patch(
     event: WorkflowFailureEvent,
     attempt_number: int,
     mcp_client: GitHubMCPClient,
+    failing_log: str | None = None,
 ) -> PatchResult:
     logger.info(
         "code_patcher: run=%d attempt=%d file=%s",
@@ -156,19 +158,41 @@ async def patch(
         }
     )
     numbered_content = _format_with_line_numbers(file_content)
-    prompt = "\n".join(
-        [
-            f"File: {diagnosis.file}",
-            "--- FILE CONTENT (each line prefixed with `NNNN | `; the prefix is NOT part of the file) ---",
-            numbered_content,
-            "--- DIAGNOSIS ---",
-            diagnosis_summary,
-            "--- END ---",
-            "Generate a unified diff to fix this bug. Use the prefixed line numbers to "
-            "compute correct `@@ -X,Y +A,B @@` hunk headers. Do NOT include the `NNNN | ` "
-            "prefix in any line of the diff itself.",
-        ]
-    )
+
+    # Pull in the failing test(s) so the model can see the EXPECTED behaviour at
+    # every boundary — pytest only prints the first failing assertion per test,
+    # so the log alone hides edge cases (e.g. "value exactly at threshold"). A fix
+    # that satisfies one assertion but violates another would otherwise slip
+    # through. We never patch the test file; it's read-only context here.
+    test_context = ""
+    if failing_log:
+        test_paths = [p for p in _extract_test_paths(failing_log) if p != diagnosis.file]
+        if test_paths:
+            aux = await _fetch_aux_files(test_paths, event, mcp_client)
+            for path, content in aux:
+                test_context += (
+                    f"\n--- FAILING TEST FILE: {path} (read-only context, do NOT edit) ---\n"
+                    f"{content}\n--- END TEST FILE ---\n"
+                )
+
+    prompt_parts = [
+        f"File: {diagnosis.file}",
+        "--- FILE CONTENT (each line prefixed with `NNNN | `; the prefix is NOT part of the file) ---",
+        numbered_content,
+        "--- DIAGNOSIS ---",
+        diagnosis_summary,
+    ]
+    if failing_log:
+        prompt_parts += ["--- FAILING TEST OUTPUT ---", failing_log.strip()]
+    if test_context:
+        prompt_parts.append(test_context)
+    prompt_parts += [
+        "--- END ---",
+        "Return the complete corrected file. Your fix MUST satisfy EVERY assertion in "
+        "the failing test(s) above, including boundary cases (values exactly at a "
+        "threshold). Do NOT include the `NNNN | ` prefix in your output.",
+    ]
+    prompt = "\n".join(prompt_parts)
 
     try:
         response_text = await get_gemini_client().generate(

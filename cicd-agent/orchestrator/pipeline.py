@@ -233,10 +233,16 @@ async def _execute_pipeline(
                     task.mark_step_done(PipelineStep.ATTEMPT_GATE)
                     await _send_notification(task, start_time)
                     return
-                # PR was closed or merged → previous fix landed (or was abandoned);
-                # the same error coming back is a NEW occurrence. Clear the stale
-                # pointer and proceed with a fresh patch.
-                registry.clear_open_pr(error_hash)
+                # PR was closed or merged. If merged, the previous fix landed —
+                # a same-shape failure now is a NEW occurrence, so reset the
+                # attempt counter so the natural cap doesn't block us. If closed
+                # without merge (human rejected), keep the count in place.
+                was_merged = (
+                    pr_data is not None
+                    and isinstance(pr_data.get("merged_at"), str)
+                    and pr_data.get("merged_at") is not None
+                )
+                registry.clear_open_pr(error_hash, reset_attempts=was_merged)
 
             attempt_count = registry.get_attempt_count(error_hash)
             if registry.is_escalated(error_hash) or attempt_count >= settings.max_patch_attempts:
@@ -253,11 +259,21 @@ async def _execute_pipeline(
         async with audit_step(event.run_id, PipelineStep.CODE_PATCH):
             task.set_state(TaskState.PATCHING)
             registry.increment_attempt(error_hash)
+            # Hand the patcher the failing log so it can read the failing test(s)
+            # and satisfy every assertion (including boundary cases), not just the
+            # first one pytest happened to print.
+            target_log = next((jl for jl in job_logs if jl.sliced_log), None)
+            failing_log = (
+                target_log.sliced_log
+                if target_log is not None
+                else (job_logs[0].raw_log[:8000] if job_logs else None)
+            )
             patch_result = await do_patch(
                 diagnosis=diagnosis,
                 event=event,
                 attempt_number=attempt_count + 1,
                 mcp_client=mcp,
+                failing_log=failing_log,
             )
             task.patch_result = patch_result
             if patch_result.success and isinstance(patch_result.pr_number, int):
@@ -266,7 +282,11 @@ async def _execute_pipeline(
                     patch_result.pr_number,
                     patch_result.pr_url,
                 )
-            if not patch_result.success:
+            elif not patch_result.success and attempt_count + 1 >= settings.max_patch_attempts:
+                # Only escalate once the natural attempt budget is exhausted.
+                # A single failed attempt should leave the door open for the
+                # next webhook to try again — otherwise one transient gemini /
+                # diff-apply hiccup permanently blocks the hash.
                 registry.mark_escalated(error_hash)
             task.mark_step_done(PipelineStep.CODE_PATCH)
 

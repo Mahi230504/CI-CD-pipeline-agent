@@ -162,13 +162,29 @@ class RunRegistry:
         url = entry.get("open_pr_url")
         return pr_number, url if isinstance(url, str) else None
 
-    def clear_open_pr(self, error_hash: str) -> None:
+    def clear_open_pr(self, error_hash: str, reset_attempts: bool = False) -> None:
+        """Drop the open-PR pointer for an error_hash.
+
+        When `reset_attempts=True`, also zero the attempt counter and escalation
+        flag — used after a previous agent PR was MERGED, so a subsequent failure
+        with the same shape is treated as a new occurrence rather than a retry of
+        an already-exhausted attempt budget.
+        """
         attempts = self._data.get("error_attempts", {})
         entry = attempts.get(error_hash)
         if not entry:
             return
-        entry.pop("open_pr_number", None)
-        entry.pop("open_pr_url", None)
+        if reset_attempts:
+            attempts[error_hash] = {
+                "count": 0,
+                "last_seen": _now_iso(),
+                "escalated": False,
+                "open_pr_number": None,
+                "open_pr_url": None,
+            }
+        else:
+            entry.pop("open_pr_number", None)
+            entry.pop("open_pr_url", None)
         self._save()
 
 

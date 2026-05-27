@@ -78,3 +78,32 @@ def test_mark_escalated_preserves_open_pr_pointer(registry: RunRegistry):
     # Escalation must keep the open PR pointer so dedup still works on next run.
     assert registry.is_escalated("h") is True
     assert registry.get_open_pr("h") == (7, "url")
+
+
+def test_clear_open_pr_default_preserves_attempts(registry: RunRegistry):
+    registry.increment_attempt("h")
+    registry.increment_attempt("h")
+    registry.record_open_pr("h", 1, "u")
+    registry.clear_open_pr("h")
+    # Default behavior: only PR pointer is dropped, attempt count survives.
+    assert registry.get_open_pr("h") is None
+    assert registry.get_attempt_count("h") == 2
+
+
+def test_clear_open_pr_reset_attempts_zeroes_counter(registry: RunRegistry):
+    registry.increment_attempt("h")
+    registry.increment_attempt("h")
+    registry.mark_escalated("h")
+    registry.record_open_pr("h", 1, "u")
+    registry.clear_open_pr("h", reset_attempts=True)
+    # After a merged-PR reset, the hash should be back to a clean slate so a
+    # new same-shape failure is treated as a fresh occurrence.
+    assert registry.get_open_pr("h") is None
+    assert registry.get_attempt_count("h") == 0
+    assert registry.is_escalated("h") is False
+
+
+def test_clear_open_pr_reset_attempts_on_missing_hash_is_noop(registry: RunRegistry):
+    registry.clear_open_pr("never-seen", reset_attempts=True)
+    assert registry.get_attempt_count("never-seen") == 0
+    assert registry.is_escalated("never-seen") is False

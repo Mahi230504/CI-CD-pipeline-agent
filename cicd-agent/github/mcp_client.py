@@ -30,6 +30,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -39,6 +40,11 @@ from mcp.client.streamable_http import streamablehttp_client
 from config.settings import get_settings
 
 logger = logging.getLogger("cicd_agent.mcp")
+
+# A full or abbreviated git commit SHA (hex, 7–64 chars — covers SHA-1 and the
+# longer SHA-256 object format). Used to detect refs that this MCP's
+# get_file_contents can't resolve (it only accepts branch/tag names).
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
 class GitHubMCPError(Exception):
@@ -234,15 +240,44 @@ class GitHubMCPClient:
         return text
 
     async def get_file_contents(self, path: str, ref: str = "main") -> str:
-        result = await self._call_tool(
-            "get_file_contents",
-            {
-                "owner": self._repo_owner,
-                "repo": self._repo_name,
-                "path": path,
-                "ref": ref,
-            },
-        )
+        try:
+            result = await self._call_tool(
+                "get_file_contents",
+                {
+                    "owner": self._repo_owner,
+                    "repo": self._repo_name,
+                    "path": path,
+                    "ref": ref,
+                },
+            )
+        except GitHubMCPError as e:
+            # This MCP's get_file_contents resolves only branch/tag names, not raw
+            # commit SHAs — a SHA ref fails with "could not resolve ref ... as a
+            # branch or a tag". The agent reads current state and rewrites whole
+            # files (the atomic commit parents off main HEAD), so retrying on the
+            # default branch yields the right content and is resolvable.
+            msg = str(e).lower()
+            if _COMMIT_SHA_RE.match(ref or "") and "resolve" in msg and "ref" in msg:
+                fallback = await self.get_repo_default_branch()
+                if fallback and fallback != ref:
+                    logger.warning(
+                        "get_file_contents: ref %s unresolvable as branch/tag, retrying on %s",
+                        ref[:8],
+                        fallback,
+                    )
+                    result = await self._call_tool(
+                        "get_file_contents",
+                        {
+                            "owner": self._repo_owner,
+                            "repo": self._repo_name,
+                            "path": path,
+                            "ref": fallback,
+                        },
+                    )
+                else:
+                    raise
+            else:
+                raise
         # GitHub MCP returns multiple content items for files:
         #   [0] TextContent: status message "successfully downloaded text file (SHA: ...)"
         #   [1] EmbeddedResource: .resource.text holds the file body
