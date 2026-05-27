@@ -23,8 +23,11 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-DAILY_REQUEST_LIMIT = 250
-DAILY_WARNING_THRESHOLD = 200
+# Request-count cap was a Gemini free-tier guard (250/day). On paid OpenRouter
+# the meaningful ceiling is the daily *cost* cap (DAILY_COST_CAP_DOLLARS), so
+# this count limit is set high enough to be effectively a safety backstop only.
+DAILY_REQUEST_LIMIT = 100_000
+DAILY_WARNING_THRESHOLD = 90_000
 
 
 class GeminiError(Exception):

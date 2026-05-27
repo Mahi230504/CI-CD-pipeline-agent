@@ -12,7 +12,13 @@ from __future__ import annotations
 from typing import Final
 
 # Per million tokens, USD. (input_rate, output_rate).
+# OpenRouter slugs (current provider) plus the legacy direct-Gemini IDs.
 _PRICING: Final[dict[str, tuple[float, float]]] = {
+    # OpenRouter model IDs (approximate published rates as of 2026-05).
+    "google/gemini-2.5-flash": (0.30, 2.50),
+    "google/gemini-2.5-flash-lite": (0.10, 0.40),
+    "google/gemini-2.5-pro": (1.25, 10.0),
+    # Legacy direct-Gemini IDs (free-tier dev / tests).
     "gemini-2.5-flash": (0.075, 0.30),
     "gemini-2.5-flash-lite": (0.05, 0.10),
     "gemini-2.5-pro": (3.50, 10.50),

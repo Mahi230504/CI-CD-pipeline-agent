@@ -21,18 +21,25 @@ from dotenv import load_dotenv
 
 @dataclass(frozen=True)
 class Settings:
-    gemini_api_key: str
+    openrouter_api_key: str
     github_pat: str
     github_webhook_secret: str
     github_repo_owner: str
     github_repo_name: str
 
-    primary_model: str = "gemini-2.5-flash"
-    light_model: str = "gemini-2.5-flash-lite"
+    # LLM provider: OpenRouter (OpenAI-compatible API). Model IDs are OpenRouter
+    # slugs. gemini_api_key is retained as optional for any direct-Gemini fallback
+    # but is no longer required.
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    gemini_api_key: str = ""
+    primary_model: str = "google/gemini-2.5-flash"
+    light_model: str = "google/gemini-2.5-flash-lite"
     max_patch_attempts: int = 2
     session_timeout_seconds: int = 180
     max_loop_iterations: int = 30
-    rate_limit_delay_seconds: float = 7.0
+    # Minimum seconds between LLM calls. OpenRouter is paid, so a small courtesy
+    # gap is enough; the free-tier 7s gap is no longer needed.
+    rate_limit_delay_seconds: float = 0.5
     webhook_port: int = 8000
     log_dir: str = "./logs"
     production_mode: bool = False
@@ -123,17 +130,19 @@ def _bool_env(name: str, default: bool) -> bool:
 def get_settings() -> Settings:
     load_dotenv()
     settings = Settings(
-        gemini_api_key=_required("GEMINI_API_KEY"),
+        openrouter_api_key=_required("OPENROUTER_API_KEY"),
         github_pat=_required("GITHUB_PERSONAL_ACCESS_TOKEN"),
         github_webhook_secret=_required("GITHUB_WEBHOOK_SECRET"),
         github_repo_owner=_required("GITHUB_REPO_OWNER"),
         github_repo_name=_required("GITHUB_REPO_NAME"),
-        primary_model=_optional("PRIMARY_MODEL", "gemini-2.5-flash"),
-        light_model=_optional("LIGHT_MODEL", "gemini-2.5-flash-lite"),
+        openrouter_base_url=_optional("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        gemini_api_key=_optional("GEMINI_API_KEY", ""),
+        primary_model=_optional("PRIMARY_MODEL", "google/gemini-2.5-flash"),
+        light_model=_optional("LIGHT_MODEL", "google/gemini-2.5-flash-lite"),
         max_patch_attempts=_int_env("MAX_PATCH_ATTEMPTS", 2),
         session_timeout_seconds=_int_env("SESSION_TIMEOUT_SECONDS", 180),
         max_loop_iterations=_int_env("MAX_LOOP_ITERATIONS", 30),
-        rate_limit_delay_seconds=_float_env("RATE_LIMIT_DELAY_SECONDS", 7.0),
+        rate_limit_delay_seconds=_float_env("RATE_LIMIT_DELAY_SECONDS", 0.5),
         webhook_port=_int_env("WEBHOOK_PORT", 8000),
         log_dir=_optional("LOG_DIR", "./logs"),
         production_mode=_bool_env("PRODUCTION_MODE", False),

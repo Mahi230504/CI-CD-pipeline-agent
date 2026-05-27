@@ -1,16 +1,20 @@
 """
-Gemini API client wrapper.
+LLM client wrapper — OpenRouter (OpenAI-compatible chat completions).
 
-Provides two async functions used by all agents:
-- generate(prompt, system_prompt) → str
-- generate_with_tools(prompt, system_prompt, mcp_session) → str
+Provides the async surface used by all agents:
+- generate(prompt, system_prompt, agent, use_light_model, temperature, strip_pii) → str
+- ping() → bool
 
 Internally:
-- Uses google-genai SDK (NOT google-generativeai)
-- Routes all calls through rate_limiter.py
-- Strips potential PII patterns from log content before sending
-- Validates that responses are non-empty and not error messages
-- Raises GeminiError (a project-specific exception) on unrecoverable failures
+- Talks to OpenRouter's /chat/completions over httpx (no extra SDK dependency).
+- Routes all calls through rate_limiter.py (concurrency + min-gap + 429 backoff).
+- Strips potential PII patterns from log content before sending.
+- Validates that responses are non-empty.
+- Raises GeminiError (project-specific) on unrecoverable failures.
+
+Naming note: the module/class/exceptions keep the historical "gemini" names so
+the agents and metrics don't have to change. The provider is now OpenRouter; the
+default models are still the google/gemini-2.5-flash family via OpenRouter.
 """
 
 from __future__ import annotations
@@ -20,8 +24,7 @@ import re
 import time
 from typing import Any
 
-from google import genai
-from google.genai import types
+import httpx
 
 from config.settings import get_settings
 from llm.rate_limiter import (
@@ -34,14 +37,14 @@ from metrics import record_gemini_call
 
 logger = logging.getLogger(__name__)
 
+_REQUEST_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 
-def _extract_token_counts(response: Any) -> tuple[int, int]:
-    """Pull (input_tokens, output_tokens) out of a Gemini response if available."""
-    meta = getattr(response, "usage_metadata", None)
-    if meta is None:
-        return 0, 0
-    inp = getattr(meta, "prompt_token_count", 0) or 0
-    out = getattr(meta, "candidates_token_count", 0) or 0
+
+def _extract_token_counts(data: dict[str, Any]) -> tuple[int, int]:
+    """Pull (input_tokens, output_tokens) from an OpenAI-shape usage block."""
+    usage = data.get("usage") or {}
+    inp = usage.get("prompt_tokens", 0) or 0
+    out = usage.get("completion_tokens", 0) or 0
     try:
         return int(inp), int(out)
     except (TypeError, ValueError):
@@ -67,37 +70,74 @@ def _strip_pii(text: str) -> str:
     return text
 
 
-def _validate_response(response: Any, agent: str) -> str:
-    candidates = getattr(response, "candidates", None)
-    if not candidates:
-        raise GeminiError("Gemini returned no candidates", agent=agent)
-
-    finish_reason = getattr(candidates[0], "finish_reason", None)
-    if finish_reason is not None:
-        fr_str = str(finish_reason).upper()
-        if "SAFETY" in fr_str or "BLOCKED" in fr_str:
-            raise GeminiError(f"Gemini response blocked: {fr_str}", agent=agent)
-
-    text = getattr(response, "text", None)
-    if not text:
-        try:
-            parts = candidates[0].content.parts
-            text = "".join(getattr(p, "text", "") or "" for p in parts)
-        except Exception:
-            text = ""
-
-    if not text or not text.strip():
-        raise GeminiError("Gemini returned empty response", agent=agent)
-
-    return text
+def _extract_text(data: dict[str, Any], agent: str) -> str:
+    choices = data.get("choices")
+    if not choices:
+        raise GeminiError("LLM returned no choices", agent=agent)
+    first = choices[0] or {}
+    finish = str(first.get("finish_reason", "")).lower()
+    if finish in ("content_filter",):
+        raise GeminiError(f"LLM response blocked: {finish}", agent=agent)
+    message = first.get("message") or {}
+    text = message.get("content")
+    if isinstance(text, list):  # some providers return content as parts
+        text = "".join(
+            part.get("text", "") for part in text if isinstance(part, dict)
+        )
+    if not text or not str(text).strip():
+        raise GeminiError("LLM returned empty response", agent=agent)
+    return str(text)
 
 
 class GeminiClient:
+    """OpenRouter-backed chat client. Name kept for call-site compatibility."""
+
     def __init__(self) -> None:
         settings = get_settings()
-        self._client = genai.Client(api_key=settings.gemini_api_key)
+        self._api_key = settings.openrouter_api_key
+        self._base_url = settings.openrouter_base_url.rstrip("/")
         self._primary_model = settings.primary_model
         self._light_model = settings.light_model
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+            # Optional OpenRouter attribution headers — harmless if ignored.
+            "HTTP-Referer": "https://github.com/cicd-intelligence-agent",
+            "X-Title": "CI/CD Intelligence Agent",
+        }
+
+    async def _chat(
+        self,
+        model: str,
+        system_prompt: str,
+        prompt: str,
+        temperature: float,
+    ) -> dict[str, Any]:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": temperature,
+        }
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+            resp = await client.post(
+                f"{self._base_url}/chat/completions",
+                headers=self._headers(),
+                json=payload,
+            )
+        # Surface HTTP errors so the rate limiter can classify 429/503 and back off.
+        if resp.status_code != 200:
+            body = resp.text[:300]
+            raise httpx.HTTPStatusError(
+                f"OpenRouter {resp.status_code}: {body}",
+                request=resp.request,
+                response=resp,
+            )
+        return resp.json()
 
     async def generate(
         self,
@@ -112,96 +152,51 @@ class GeminiClient:
             prompt = _strip_pii(prompt)
 
         model = self._light_model if use_light_model else self._primary_model
-        config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=temperature,
-        )
 
-        async def _call():
-            return await self._client.aio.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=config,
-            )
+        async def _call() -> dict[str, Any]:
+            return await self._chat(model, system_prompt, prompt, temperature)
 
         started = time.monotonic()
         try:
-            response = await rate_limited_call(_call)
+            data = await rate_limited_call(_call)
         except (GeminiError, GeminiRateLimitError, DailyLimitReachedError):
             raise
         except Exception as e:
             raise GeminiError(f"{agent}: {e}", agent=agent, original=e) from e
 
         duration = time.monotonic() - started
-        in_toks, out_toks = _extract_token_counts(response)
+        in_toks, out_toks = _extract_token_counts(data)
         cost = record_gemini_call(model, duration, in_toks, out_toks)
         logger.info(
-            "gemini: agent=%s model=%s dur=%.2fs in=%d out=%d cost=$%.5f",
+            "llm: agent=%s model=%s dur=%.2fs in=%d out=%d cost=$%.5f",
             agent, model, duration, in_toks, out_toks, cost,
         )
-        return _validate_response(response, agent)
-
-    async def generate_with_tools(
-        self,
-        prompt: str,
-        system_prompt: str,
-        mcp_session: Any,
-        agent: str,
-        temperature: float = 0.1,
-        max_tool_calls: int = 10,
-    ) -> str:
-        config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=temperature,
-            tools=[mcp_session],
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                maximum_remote_calls=max_tool_calls,
-            ),
-        )
-
-        async def _call():
-            return await self._client.aio.models.generate_content(
-                model=self._primary_model,
-                contents=prompt,
-                config=config,
-            )
-
-        started = time.monotonic()
-        try:
-            response = await rate_limited_call(_call)
-        except (GeminiError, GeminiRateLimitError, DailyLimitReachedError):
-            raise
-        except Exception as e:
-            raise GeminiError(f"{agent}: {e}", agent=agent, original=e) from e
-
-        duration = time.monotonic() - started
-        in_toks, out_toks = _extract_token_counts(response)
-        record_gemini_call(self._primary_model, duration, in_toks, out_toks)
-        return _validate_response(response, agent)
+        return _extract_text(data, agent)
 
     async def ping(self) -> bool:
         import asyncio as _asyncio
+
         last_exc: Exception | None = None
-        # Use primary model — light model has tighter daily quota on free tier.
         for attempt in (1, 2, 3):
             try:
-                response = await self._client.aio.models.generate_content(
-                    model=self._primary_model,
-                    contents="Reply with just the word OK.",
-                    config=types.GenerateContentConfig(temperature=0.0),
+                data = await self._chat(
+                    self._primary_model,
+                    "You are a health check.",
+                    "Reply with just the word OK.",
+                    0.0,
                 )
-                text = getattr(response, "text", "") or ""
+                text = _extract_text(data, "ping")
                 if text.strip():
-                    logger.info("gemini ping: ok (attempt %d)", attempt)
+                    logger.info("llm ping: ok (attempt %d)", attempt)
                     return True
-                logger.warning("gemini ping: empty response (attempt %d)", attempt)
+                logger.warning("llm ping: empty response (attempt %d)", attempt)
             except Exception as e:
                 last_exc = e
-                logger.warning("gemini ping failed (attempt %d): %s", attempt, e)
+                logger.warning("llm ping failed (attempt %d): %s", attempt, e)
             if attempt < 3:
                 await _asyncio.sleep(2 * attempt)
         if last_exc is not None:
-            logger.warning("gemini ping: giving up after 3 attempts: %s", last_exc)
+            logger.warning("llm ping: giving up after 3 attempts: %s", last_exc)
         return False
 
 
@@ -212,7 +207,7 @@ def init_gemini_client() -> GeminiClient:
     global _gemini_client
     _gemini_client = GeminiClient()
     logger.info(
-        "gemini_client initialised: primary=%s light=%s",
+        "llm_client initialised (OpenRouter): primary=%s light=%s",
         _gemini_client._primary_model,
         _gemini_client._light_model,
     )
@@ -222,6 +217,6 @@ def init_gemini_client() -> GeminiClient:
 def get_gemini_client() -> GeminiClient:
     if _gemini_client is None:
         raise RuntimeError(
-            "gemini_client not initialised — call init_gemini_client() at startup"
+            "llm_client not initialised — call init_gemini_client() at startup"
         )
     return _gemini_client
