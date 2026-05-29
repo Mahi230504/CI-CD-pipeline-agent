@@ -15,7 +15,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from models.events import WebhookPayload
 
 
 def _now() -> datetime:
@@ -84,6 +87,28 @@ class ReleaseSuccessEvent:
             "sha": self.short_sha,
             "pr": self.pr_number,
         }
+
+    @classmethod
+    def from_payload(cls, payload: "WebhookPayload") -> "ReleaseSuccessEvent":
+        """Normalise a successful release workflow_run into the CD event.
+
+        Mirrors `WorkflowFailureEvent.from_payload` so the router can pick
+        the matching constructor by event class. `pr_number` is left None
+        here — release workflow_run payloads typically don't carry
+        `pull_requests`; the CD pipeline resolves PR via
+        `rest_api.get_pulls_for_commit(head_sha)` at runtime.
+        """
+        return cls(
+            run_id=payload.run_id,
+            repo_owner=payload.repo_owner,
+            repo_name=payload.repo_name,
+            workflow_name=payload.run_name,
+            branch=payload.branch,
+            head_sha=payload.head_sha,
+            html_url=payload.html_url,
+            sender_login=payload.sender_login,
+            pr_number=None,
+        )
 
 
 @dataclass(frozen=True)
