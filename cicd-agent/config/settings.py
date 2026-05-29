@@ -53,6 +53,46 @@ class Settings:
     # Path for the JSON run registry (dedup + attempt counting).
     run_registry_path: str = "./run_registry.json"
 
+    # ── CD pipeline (Phase 3) ────────────────────────────────────────────
+    # GitHub Codespace name the deployer SSHes into. Resolved via
+    # `gh codespace ssh -c $codespace_name -- "<cmd>"`. Empty disables the
+    # CD half of the pipeline (orchestrator skips the release event).
+    codespace_name: str = ""
+    # Absolute path inside the codespace where the demo repo is checked out
+    # — used as the working directory for `docker compose` invocations and
+    # for the `.env` edit that pins IMAGE_TAG.
+    codespace_workdir: str = "/workspaces/cicd-agent-demo"
+    # Public tunnel URL of the codespace's port 8000. The health monitor
+    # probes /health and /version against this; the agent posts reasoning
+    # events here too. Trailing slash is stripped at access time.
+    backend_base_url: str = ""
+    # Shared secret used in the X-Agent-Token header when posting events to
+    # /internal/agent-event. Must match the demo backend's AGENT_SHARED_SECRET.
+    # Empty disables event publishing (the agent runs but the dashboard
+    # won't show its reasoning live).
+    agent_shared_secret: str = ""
+    # The GHCR image repo. Combined with the head_sha to form the full
+    # image reference (`<repo>:<short_sha>`) the deployer writes into the
+    # codespace's .env before `docker compose pull && up -d`.
+    deploy_image_repository: str = ""
+    # The .env variable name the codespace's docker-compose.yml interpolates
+    # for the api/worker service `image:` line. Default matches the demo
+    # repo's compose file (`${API_IMAGE:-inventory-flow-api:local}`).
+    deploy_image_env_var: str = "API_IMAGE"
+    # Name of the release workflow whose successful runs trigger CD. The
+    # router filters workflow_run events by this name in addition to the
+    # existing failure routing.
+    release_workflow_name: str = "release"
+    # Wait this many seconds for /health to return 200 AND /version to
+    # report the expected SHA before declaring the deploy a failure.
+    deploy_health_timeout_seconds: int = 90
+    # Sleep between health probe attempts. Combined with the timeout this
+    # gives the number of attempts the monitor will make.
+    deploy_health_poll_interval_seconds: float = 3.0
+    # If false, a failed health check is reported but no rollback happens.
+    # Default to enabling rollback because that's the demoable behaviour.
+    auto_rollback_enabled: bool = True
+
     @property
     def github_mcp_url(self) -> str:
         return "https://api.githubcopilot.com/mcp"
@@ -80,6 +120,38 @@ class Settings:
     @property
     def full_repo_name(self) -> str:
         return f"{self.github_repo_owner}/{self.github_repo_name}"
+
+    @property
+    def cd_enabled(self) -> bool:
+        """True only when every input required to actually deploy is set.
+
+        Used by the router to decide whether release-success events should be
+        accepted, and by the CD orchestrator as a guard at entry so a
+        misconfigured environment fails loud once rather than producing a
+        cascade of mysterious subprocess errors.
+        """
+        return bool(
+            self.codespace_name
+            and self.backend_base_url
+            and self.deploy_image_repository
+        )
+
+    @property
+    def backend_base_url_clean(self) -> str:
+        """Trailing-slash-free form for safe URL concatenation."""
+        return self.backend_base_url.rstrip("/")
+
+    @property
+    def agent_events_url(self) -> str:
+        """Where event_publisher POSTs reasoning events.
+
+        Returns the empty string when the backend URL is not configured; the
+        publisher treats that as a no-op rather than a hard failure so unit
+        tests and dev runs without a backend still work.
+        """
+        if not self.backend_base_url:
+            return ""
+        return f"{self.backend_base_url_clean}/internal/agent-event"
 
 
 def _required(name: str) -> str:
@@ -153,6 +225,18 @@ def get_settings() -> Settings:
         cost_cap_warn_pct=_float_env("COST_CAP_WARN_PCT", 0.8),
         queue_db_path=_optional("QUEUE_DB_PATH", "./queue.sqlite3"),
         run_registry_path=_optional("RUN_REGISTRY_PATH", "./run_registry.json"),
+        codespace_name=_optional("CODESPACE_NAME", ""),
+        codespace_workdir=_optional("CODESPACE_WORKDIR", "/workspaces/cicd-agent-demo"),
+        backend_base_url=_optional("BACKEND_BASE_URL", ""),
+        agent_shared_secret=_optional("AGENT_SHARED_SECRET", ""),
+        deploy_image_repository=_optional("DEPLOY_IMAGE_REPOSITORY", ""),
+        deploy_image_env_var=_optional("DEPLOY_IMAGE_ENV_VAR", "API_IMAGE"),
+        release_workflow_name=_optional("RELEASE_WORKFLOW_NAME", "release"),
+        deploy_health_timeout_seconds=_int_env("DEPLOY_HEALTH_TIMEOUT_SECONDS", 90),
+        deploy_health_poll_interval_seconds=_float_env(
+            "DEPLOY_HEALTH_POLL_INTERVAL_SECONDS", 3.0
+        ),
+        auto_rollback_enabled=_bool_env("AUTO_ROLLBACK_ENABLED", True),
     )
     print(
         f"⚙ Settings loaded: repo={settings.full_repo_name}, "
