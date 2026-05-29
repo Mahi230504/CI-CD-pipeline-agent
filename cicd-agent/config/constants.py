@@ -61,6 +61,14 @@ class PipelineStep(StrEnum):
     CODE_PATCH = "code_patch"
     YAML_OPTIMIZE = "yaml_optimize"
     NOTIFY = "notify"
+    # ── CD pipeline steps (Phase 3) ──────────────────────────────────
+    # The CD half runs in a separate pipeline triggered by a successful
+    # release.yml workflow_run — but the audit logger keys on this enum,
+    # so the steps live in the same namespace.
+    DEPLOY_GUARD = "deploy_guard"
+    DEPLOY = "deploy"
+    HEALTH_CHECK = "health_check"
+    ROLLBACK = "rollback"
 
 
 class ErrorCategory(StrEnum):

@@ -254,6 +254,45 @@ def parse_flakiness_verdict(text: str) -> Optional[dict]:
         return None
 
 
+def parse_deploy_verdict(text: str) -> Optional["DeployVerdict"]:
+    """Parse the deploy guard's JSON response into a DeployVerdict.
+
+    Tolerant of the same wrapping a strict prompt may still produce: bare
+    JSON, ```json``` fences, or JSON embedded in surrounding prose. Returns
+    None when no JSON object can be extracted or required fields are
+    missing — the orchestrator treats None as an automatic block.
+
+    The import is deferred so this module stays usable in any context
+    where models.cd hasn't been loaded yet (e.g. log-side-only tools).
+    """
+    from models.cd import DeployRisk, DeployVerdict
+
+    raw = _extract_json_from_text(text)
+    if raw is None:
+        return None
+    data = _try_parse_json(raw)
+    if not isinstance(data, dict):
+        return None
+
+    if "approve" not in data:
+        return None
+
+    concerns_raw = data.get("concerns", [])
+    if isinstance(concerns_raw, list):
+        concerns = tuple(str(c).strip() for c in concerns_raw if str(c).strip())
+    else:
+        concerns = ()
+
+    return DeployVerdict(
+        approve=_coerce_bool(data.get("approve", False)),
+        risk=DeployRisk.coerce(data.get("risk")),
+        reason=str(data.get("reason", "")).strip() or "no reason provided",
+        concerns=concerns,
+        confidence=_clamp_float(data.get("confidence", 0.0)),
+        raw_response=text,
+    )
+
+
 def validate_json_output(text: str, required_keys: list[str]) -> Optional[dict]:
     try:
         raw = _extract_json_from_text(text)

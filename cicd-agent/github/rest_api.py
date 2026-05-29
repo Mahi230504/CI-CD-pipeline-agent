@@ -226,3 +226,80 @@ async def create_atomic_commit(
         "" if len(files) == 1 else "s",
     )
     return commit["sha"]
+
+
+# ── CD inputs ────────────────────────────────────────────────────────────
+# These helpers exist for the deploy guard: it needs the unified diff of a
+# merged PR plus the list of files changed. The MCP server can serve this
+# data too but with awkward pagination; REST is simpler for the synchronous
+# shape this code path needs.
+
+
+async def get_pr_diff(pr_number: int) -> str | None:
+    """Fetch the unified diff of a PR via the `vnd.github.v3.diff` Accept header.
+
+    Returns None on any non-200, including the 406 GitHub returns when a PR
+    has zero files (rare but possible for revert-then-merge sequences).
+    Diff size is unbounded — the caller (deploy_guard) truncates if needed.
+    """
+    url = f"{_BASE}/repos/{_repo_path()}/pulls/{pr_number}"
+    headers = {**_headers(), "Accept": "application/vnd.github.v3.diff"}
+    async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.warning(
+                    "get_pr_diff #%d -> %d: %s", pr_number, resp.status, text[:200]
+                )
+                return None
+            return await resp.text()
+
+
+async def get_pr_files(pr_number: int) -> list[str]:
+    """Return the file paths changed by a PR.
+
+    Returns an empty list on any failure — deploy_guard tolerates missing
+    file lists (the diff carries the signal); this is a convenience for the
+    notifier and audit log.
+    """
+    url = f"{_BASE}/repos/{_repo_path()}/pulls/{pr_number}/files?per_page=100"
+    async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
+        async with session.get(url, headers=_headers()) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.warning(
+                    "get_pr_files #%d -> %d: %s", pr_number, resp.status, text[:200]
+                )
+                return []
+            data = await resp.json()
+    if not isinstance(data, list):
+        return []
+    out: list[str] = []
+    for entry in data:
+        if isinstance(entry, dict):
+            path = entry.get("filename")
+            if isinstance(path, str) and path:
+                out.append(path)
+    return out
+
+
+async def get_pulls_for_commit(sha: str) -> list[dict[str, Any]]:
+    """List PRs that contain `sha`. Used to map a workflow_run head_sha
+    back to its merged PR when GitHub doesn't populate workflow_run.pull_requests.
+
+    Returns the raw PR dicts (with `number`, `title`, `body`, `state`,
+    `merged_at`, etc.). Empty list on any failure.
+    """
+    url = f"{_BASE}/repos/{_repo_path()}/commits/{sha}/pulls"
+    # The endpoint requires this specific Accept value to enumerate associated PRs.
+    headers = {**_headers(), "Accept": "application/vnd.github.groot-preview+json"}
+    async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.warning(
+                    "get_pulls_for_commit %s -> %d: %s", sha[:8], resp.status, text[:200]
+                )
+                return []
+            data = await resp.json()
+    return data if isinstance(data, list) else []

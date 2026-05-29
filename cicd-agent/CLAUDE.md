@@ -12,12 +12,13 @@ A production-grade, multi-agent CI/CD intelligence system that:
 5. Notifies via Slack or Telegram with full report
 
 ## LLM provider
-- Primary model: Gemini 2.5 Flash (gemini-2.5-flash) — for log analyst, code patcher, yaml optimizer
-- Light model: Gemini 2.5 Flash Lite (gemini-2.5-flash-lite) — for notifier only
-- SDK: google-genai (NOT google-generativeai — that is deprecated)
-- MCP: pass ClientSession directly into tools=[session] parameter
-- Rate limit: 10 RPM, 250 RPD on free tier — enforce 7s minimum between calls via rate_limiter.py
-- All Gemini calls MUST go through llm/gemini_client.py — never call the SDK directly from agents
+- Provider: OpenRouter (OpenAI-compatible /chat/completions over httpx). API key in OPENROUTER_API_KEY.
+- Primary model: google/gemini-2.5-flash — for log analyst, code patcher, yaml optimizer
+- Light model: google/gemini-2.5-flash-lite — for notifier only
+- Models are OpenRouter slugs (PRIMARY_MODEL / LIGHT_MODEL in .env). Swap providers by changing the slug.
+- Rate limit: paid tier — small min-gap (RATE_LIMIT_DELAY_SECONDS, default 0.5s) + 429/503 backoff-retry in rate_limiter.py. Daily $ cap via DAILY_COST_CAP_DOLLARS.
+- All LLM calls MUST go through llm/gemini_client.py (get_gemini_client().generate) — never call the HTTP API directly from agents. (Module/class keep the historical "gemini" names for call-site stability; provider is OpenRouter.)
+- NOTE: native MCP tool-binding (passing a ClientSession into the model) is NOT supported on OpenRouter; agents fetch GitHub data via github/mcp_client and pass it as text.
 
 ## GitHub integration
 - GitHub MCP server via HTTP transport (PAT authentication)

@@ -20,8 +20,14 @@ import logging
 from audit.logger import get_audit_logger
 from config.constants import MAX_QUEUE_DEPTH
 from metrics import queue_depth
+from models.cd import ReleaseSuccessEvent
 from models.events import WorkflowFailureEvent
 from orchestrator.event_store import get_event_store
+
+# A queue item is either a CI failure (persisted, replayable on restart) or a
+# CD release success (in-memory only — re-deploying a stale SHA after a crash
+# would be unsafe; the next release fires its own event).
+QueueEvent = WorkflowFailureEvent | ReleaseSuccessEvent
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +37,7 @@ _STOP_TIMEOUT_SECONDS = 30.0
 
 class TaskQueue:
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[WorkflowFailureEvent] = asyncio.Queue()
+        self._queue: asyncio.Queue[QueueEvent] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._running: bool = False
         self._processed: int = 0
@@ -79,7 +85,7 @@ class TaskQueue:
                 self._failed,
             )
 
-    async def enqueue(self, event: WorkflowFailureEvent) -> bool:
+    async def enqueue(self, event: QueueEvent) -> bool:
         if self._queue.qsize() >= MAX_QUEUE_DEPTH:
             logger.warning(
                 "task_queue full (%d/%d) — rejecting run %d",
@@ -88,24 +94,28 @@ class TaskQueue:
                 event.run_id,
             )
             return False
-        # Persist BEFORE accepting in-memory so a crash between here and the
-        # worker picking it up doesn't lose the event.
-        try:
-            inserted = get_event_store().enqueue(event)
-            if not inserted:
-                logger.info(
-                    "task_queue: run %d already persisted — skipping duplicate enqueue",
-                    event.run_id,
-                )
-                return True  # idempotent
-        except RuntimeError:
-            # event_store not initialised — happens in unit tests that don't go
-            # through the FastAPI lifespan. Fall through to in-memory only.
-            pass
+        # CI failure events get persisted to the durable store so a crash
+        # between accept and pickup doesn't lose them. CD release events
+        # are in-memory only: re-deploying after a crash could ship a
+        # stale SHA, and the next release fires its own webhook anyway.
+        if isinstance(event, WorkflowFailureEvent):
+            try:
+                inserted = get_event_store().enqueue(event)
+                if not inserted:
+                    logger.info(
+                        "task_queue: run %d already persisted — skipping duplicate enqueue",
+                        event.run_id,
+                    )
+                    return True  # idempotent
+            except RuntimeError:
+                # event_store not initialised — happens in unit tests that don't
+                # go through the FastAPI lifespan. Fall through to in-memory only.
+                pass
         await self._queue.put(event)
         queue_depth.set(self._queue.qsize())
         logger.info(
-            "Enqueued run %d. Queue depth: %d",
+            "Enqueued %s run %d. Queue depth: %d",
+            "release" if isinstance(event, ReleaseSuccessEvent) else "failure",
             event.run_id,
             self._queue.qsize(),
         )
@@ -128,6 +138,9 @@ class TaskQueue:
         return replayed
 
     async def _worker(self) -> None:
+        # Imported lazily so unit tests that don't exercise the pipeline
+        # don't pay the import cost (and don't drag in MCP transport deps).
+        from orchestrator.cd_pipeline import run_cd_pipeline
         from orchestrator.pipeline import run_pipeline
 
         logger.info("task_queue worker loop entered")
@@ -143,12 +156,17 @@ class TaskQueue:
                 raise
             queue_depth.set(self._queue.qsize())
 
+            is_release = isinstance(event, ReleaseSuccessEvent)
             try:
-                try:
-                    get_event_store().mark_processing(event.run_id)
-                except RuntimeError:
-                    pass
-                await run_pipeline(event)
+                if not is_release:
+                    try:
+                        get_event_store().mark_processing(event.run_id)
+                    except RuntimeError:
+                        pass
+                if is_release:
+                    await run_cd_pipeline(event)
+                else:
+                    await run_pipeline(event)
                 self._processed += 1
             except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
                 raise
@@ -158,7 +176,8 @@ class TaskQueue:
                 # whole process. Log, dead-letter, keep the worker alive.
                 self._failed += 1
                 logger.error(
-                    "task_queue: pipeline error for run %d (%s): %s",
+                    "task_queue: pipeline error for %s run %d (%s): %s",
+                    "release" if is_release else "failure",
                     event.run_id,
                     type(e).__name__,
                     e,
@@ -167,20 +186,20 @@ class TaskQueue:
                 err_for_dl = e if isinstance(e, Exception) else Exception(repr(e))
                 await self._dead_letter(event, err_for_dl)
             finally:
-                # Mark done in the persistent store regardless of outcome — failure
-                # is recorded via dead-letter + pipeline_outcomes_total{outcome=failed}.
-                # We don't want a failing event to be replayed in a hot loop on restart.
-                try:
-                    get_event_store().mark_done(event.run_id)
-                except RuntimeError:
-                    pass
+                # CI events are durably tracked; mark done so they don't replay
+                # on restart. CD events were never persisted, so nothing to clear.
+                if not is_release:
+                    try:
+                        get_event_store().mark_done(event.run_id)
+                    except RuntimeError:
+                        pass
                 self._queue.task_done()
 
         logger.info("task_queue worker stopped")
 
     async def _dead_letter(
         self,
-        event: WorkflowFailureEvent,
+        event: QueueEvent,
         error: Exception,
     ) -> None:
         try:
@@ -210,5 +229,5 @@ def get_task_queue() -> TaskQueue:
     return _task_queue
 
 
-async def enqueue_event(event: WorkflowFailureEvent) -> bool:
+async def enqueue_event(event: QueueEvent) -> bool:
     return await get_task_queue().enqueue(event)

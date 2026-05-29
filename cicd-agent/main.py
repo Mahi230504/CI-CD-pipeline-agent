@@ -50,12 +50,12 @@ async def startup_checks() -> bool:
     try:
         ok = await client.ping()
     except Exception as e:
-        print(f"✗ Gemini API: failed ({e})")
+        print(f"✗ LLM (OpenRouter): failed ({e})")
         return False
     if not ok:
-        print("✗ Gemini API: empty response")
+        print("✗ LLM (OpenRouter): empty response")
         return False
-    print(f"✓ Gemini API: connected ({settings.primary_model})")
+    print(f"✓ LLM (OpenRouter): connected ({settings.primary_model})")
 
     url = f"https://api.github.com/repos/{settings.full_repo_name}"
     headers = {
