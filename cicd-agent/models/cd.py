@@ -76,7 +76,10 @@ class ReleaseSuccessEvent:
 
     @property
     def short_sha(self) -> str:
-        return self.head_sha[:8]
+        # Must match the image tag release.yml pushes, which uses
+        # `git rev-parse --short` (7-char default). An 8-char tag would not
+        # exist in GHCR and the deployer's `docker compose pull` would fail.
+        return self.head_sha[:7]
 
     @property
     def log_context(self) -> dict[str, Any]:

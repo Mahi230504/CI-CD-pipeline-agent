@@ -1,0 +1,36 @@
+{
+  "runs": {
+    "26439015706": {
+      "processed_at": "2026-05-27T06:32:50.564408+00:00",
+      "state": "optimizing"
+    },
+    "26506665078": {
+      "processed_at": "2026-05-27T11:02:21.101571+00:00",
+      "state": "escalated"
+    },
+    "26509859887": {
+      "processed_at": "2026-05-27T12:37:46.734211+00:00",
+      "state": "optimizing"
+    },
+    "26562454959": {
+      "processed_at": "2026-05-28T08:02:09.776036+00:00",
+      "state": "deduped"
+    }
+  },
+  "error_attempts": {
+    "c2c6c5aa9be29cc0": {
+      "count": 1,
+      "last_seen": "2026-05-27T06:32:32.505486+00:00",
+      "escalated": false,
+      "open_pr_number": null,
+      "open_pr_url": null
+    },
+    "0f2e489530988ec9": {
+      "count": 1,
+      "last_seen": "2026-05-27T12:37:01.897096+00:00",
+      "escalated": false,
+      "open_pr_number": 7,
+      "open_pr_url": "https://github.com/Mahi230504/cicd-agent-demo/pull/7"
+    }
+  }
+}

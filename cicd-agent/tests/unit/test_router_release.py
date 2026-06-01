@@ -98,9 +98,15 @@ def cd_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "fake")
     monkeypatch.setenv("GITHUB_REPO_OWNER", "x")
     monkeypatch.setenv("GITHUB_REPO_NAME", "y")
-    monkeypatch.delenv("CODESPACE_NAME", raising=False)
-    monkeypatch.delenv("BACKEND_BASE_URL", raising=False)
-    monkeypatch.delenv("DEPLOY_IMAGE_REPOSITORY", raising=False)
+    # Empty strings (not delenv): get_settings() calls load_dotenv(), which
+    # would otherwise repopulate these from the developer's real .env file
+    # (making cd_enabled True). RELEASE_WORKFLOW_NAME is pinned so the
+    # lowercase "release" payload still matches the name gate and the test
+    # reaches the cd_enabled check it is actually asserting on.
+    monkeypatch.setenv("CODESPACE_NAME", "")
+    monkeypatch.setenv("BACKEND_BASE_URL", "")
+    monkeypatch.setenv("DEPLOY_IMAGE_REPOSITORY", "")
+    monkeypatch.setenv("RELEASE_WORKFLOW_NAME", "release")
     yield
     settings_module.get_settings.cache_clear()
 

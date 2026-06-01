@@ -59,28 +59,38 @@ _BUILD_REMOTE_SCRIPT_DEPLOY = r"""
 set -eu
 cd {workdir}
 touch .env
-# Replace the existing line if present, otherwise append. Use a tmpfile so
-# a partial write can't leave .env corrupt. macOS/BSD sed semantics differ
-# from GNU; avoid sed entirely.
-python3 - <<'PYEOF'
-import os, pathlib
+# Replace each existing line if present, otherwise append. Use a single
+# python pass so a partial write can't leave .env corrupt. macOS/BSD sed
+# semantics differ from GNU; avoid sed entirely.
+#
+# We set the image ref AND the VERSION marker the demo's /version endpoint
+# reads (mirroring scripts/deploy.sh). Without VERSION, /version keeps
+# reporting the previous commit and health_monitor's SHA check never
+# passes — so every deploy would spuriously roll back.
+DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+python3 - "$DEPLOYED_AT" <<'PYEOF'
+import sys, pathlib
+deployed_at = sys.argv[1]
+updates = {updates_repr}
+updates["VERSION_DEPLOYED_AT"] = deployed_at
 p = pathlib.Path('.env')
 lines = p.read_text().splitlines() if p.exists() else []
-key = {env_var_repr}
-new_value = {new_value_repr}
 out = []
-replaced = False
+seen = set()
 for ln in lines:
-    if ln.startswith(key + '='):
-        out.append(key + '=' + new_value)
-        replaced = True
+    key = ln.split('=', 1)[0] if '=' in ln else None
+    if key in updates:
+        out.append(key + '=' + updates[key])
+        seen.add(key)
     else:
         out.append(ln)
-if not replaced:
-    out.append(key + '=' + new_value)
+for key, val in updates.items():
+    if key not in seen:
+        out.append(key + '=' + val)
 p.write_text('\n'.join(out) + '\n')
 PYEOF
 echo "[deployer] {env_var}=$(grep -E '^{env_var}=' .env | head -n1 | cut -d= -f2-)"
+echo "[deployer] VERSION=$(grep -E '^VERSION=' .env | head -n1 | cut -d= -f2-)"
 docker compose pull api worker
 docker compose up -d api worker
 echo "[deployer] running containers:"
@@ -228,11 +238,17 @@ async def deploy(image_tag: str) -> DeployResult:
         logger.warning("deployer: prev-tag read raised: %s", e)
         prev_tag = ""
 
+    # The VERSION marker must equal the tag the health check expects, which
+    # is the tag portion of the image ref (== ReleaseSuccessEvent.short_sha).
+    version = image_tag.rsplit(":", 1)[-1]
+    updates = {
+        settings.deploy_image_env_var: image_tag,
+        "VERSION": version,
+    }
     script = _BUILD_REMOTE_SCRIPT_DEPLOY.format(
         workdir=shlex.quote(settings.codespace_workdir),
         env_var=settings.deploy_image_env_var,
-        env_var_repr=_python_literal(settings.deploy_image_env_var),
-        new_value_repr=_python_literal(image_tag),
+        updates_repr=repr(updates),
     )
 
     try:

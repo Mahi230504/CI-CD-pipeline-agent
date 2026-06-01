@@ -31,7 +31,10 @@ def no_codespace(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "fake")
     monkeypatch.setenv("GITHUB_REPO_OWNER", "test")
     monkeypatch.setenv("GITHUB_REPO_NAME", "demo")
-    monkeypatch.delenv("CODESPACE_NAME", raising=False)
+    # Empty string (not delenv): get_settings() calls load_dotenv(), which
+    # would otherwise repopulate CODESPACE_NAME from the developer's real
+    # .env file. An explicit "" in os.environ wins over the file.
+    monkeypatch.setenv("CODESPACE_NAME", "")
     yield
     settings_module.get_settings.cache_clear()
 
@@ -103,7 +106,9 @@ def test_build_image_ref_rejects_missing_repo(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "fake")
     monkeypatch.setenv("GITHUB_REPO_OWNER", "test")
     monkeypatch.setenv("GITHUB_REPO_NAME", "demo")
-    monkeypatch.delenv("DEPLOY_IMAGE_REPOSITORY", raising=False)
+    # Empty string rather than delenv — load_dotenv() in get_settings() would
+    # otherwise repopulate this from the developer's real .env file.
+    monkeypatch.setenv("DEPLOY_IMAGE_REPOSITORY", "")
     try:
         with pytest.raises(ValueError, match="DEPLOY_IMAGE_REPOSITORY"):
             deployer.build_image_ref("xyz")

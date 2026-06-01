@@ -83,7 +83,9 @@ async def test_check_returns_failure_when_base_url_missing(
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "fake")
     monkeypatch.setenv("GITHUB_REPO_OWNER", "test")
     monkeypatch.setenv("GITHUB_REPO_NAME", "demo")
-    monkeypatch.delenv("BACKEND_BASE_URL", raising=False)
+    # Empty string (not delenv): get_settings() calls load_dotenv(), which
+    # would otherwise repopulate this from the developer's real .env file.
+    monkeypatch.setenv("BACKEND_BASE_URL", "")
     try:
         report = await health_monitor.check("abc1234")
     finally:

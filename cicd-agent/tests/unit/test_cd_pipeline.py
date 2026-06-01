@@ -175,8 +175,8 @@ async def test_happy_path_deploys_and_verifies(cd_settings: None, spy: _Spy) -> 
 
     assert state.outcome == "deployed"
     assert state.error_message is None
-    assert spy.deploy_calls == ["ghcr.io/x/y:abc12345"]
-    assert spy.health_calls == ["abc12345"]
+    assert spy.deploy_calls == ["ghcr.io/x/y:abc1234"]
+    assert spy.health_calls == ["abc1234"]
     assert spy.rollback_calls == []
     # Sanity check that key publish events fired.
     stages = [p[0] for p in spy.published]
