@@ -85,14 +85,10 @@ class _FakeMCP:
         return self.files.get(path, "")
 
 
-class _Event:
-    head_sha = "deadbeefcafe"
-
-
 async def test_fetch_import_context_resolves_first_candidate_and_bounds():
     mcp = _FakeMCP({"app/models.py": "class Item: ...", "app/schemas.py": "class ItemCreate: ..."})
     imports = [("app.models", ["Item"]), ("app.schemas", ["ItemCreate"])]
-    out = await _fetch_import_context(imports, _Event(), mcp)
+    out = await _fetch_import_context(imports, mcp, "deadbeefcafe")
     fetched = {p for p, _ in out}
     assert fetched == {"app/models.py", "app/schemas.py"}
     # `app/models.py` resolved on the first candidate, so __init__.py isn't tried.
@@ -101,7 +97,7 @@ async def test_fetch_import_context_resolves_first_candidate_and_bounds():
 
 async def test_fetch_import_context_skips_missing_modules():
     mcp = _FakeMCP({})  # nothing resolves
-    out = await _fetch_import_context([("app.gone", [])], _Event(), mcp)
+    out = await _fetch_import_context([("app.gone", [])], mcp, "ref")
     assert out == []
 
 

@@ -390,11 +390,19 @@ async def apply_patch_set(
     run_id: int,
     head_sha: str,
     mcp_client: GitHubMCPClient,
+    base_ref: str | None = None,
 ) -> PatchResult:
     """Validate, apply, commit, and open/update the PR for a (possibly multi-file)
-    unified diff. Replaces the per-run-branch `create_patch_pr` flow."""
+    unified diff. Replaces the per-run-branch `create_patch_pr` flow.
 
-    patch_set = await build_patch_set(diff, base_ref=head_sha, mcp_client=mcp_client)
+    `base_ref` is the ref the diff was synthesized against (where the file
+    content came from) — the original failing commit on a first attempt, or the
+    fix branch on a retry. Defaults to `head_sha` for backwards compatibility.
+    """
+
+    patch_set = await build_patch_set(
+        diff, base_ref=base_ref or head_sha, mcp_client=mcp_client
+    )
     if patch_set is None:
         return PatchResult(
             branch_name=ROLLING_PATCH_BRANCH,

@@ -113,7 +113,9 @@ Rules:
 - The implicit diff between the original and your output must not delete more than
   30 lines.
 - If the fix requires an import that is not already in the file, add it at the top
-  of the existing import block — do not invent a new section.
+  of the existing import block — do not invent a new section. Conversely, if your
+  change leaves an existing import unused, REMOVE it: a leftover import fails linters
+  (e.g. Ruff F401 "imported but unused"). Only keep imports the final code uses.
 - Never touch `.env`, secret files, certificates, or anything matching
   `.github/workflows/*` (workflow YAML has its own dedicated pipeline).
 - If a safe targeted fix is not possible — including blocked file types, secrets,

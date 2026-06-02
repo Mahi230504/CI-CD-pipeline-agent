@@ -27,6 +27,7 @@ from dataclasses import replace
 
 from agents.ci_verifier import verify_patch_ci
 from agents.log_analyst import _extract_test_paths, _fetch_aux_files
+from config.constants import ROLLING_PATCH_BRANCH
 from config.prompts import CODE_PATCHER_SYSTEM_PROMPT
 from config.settings import get_settings
 from github.mcp_client import GitHubMCPClient, GitHubMCPError
@@ -133,8 +134,8 @@ def _rank_imports(
 
 async def _fetch_import_context(
     imports: list[tuple[str, list[str]]],
-    event: WorkflowFailureEvent,
     mcp_client: GitHubMCPClient,
+    ref: str,
 ) -> list[tuple[str, str]]:
     """Fetch the source of referenced first-party modules, bounded by file
     count and total chars. Tries `<mod>.py` then `<mod>/__init__.py`; the first
@@ -147,7 +148,7 @@ async def _fetch_import_context(
             break
         for candidate in _module_to_paths(module):
             try:
-                content = await mcp_client.get_file_contents(candidate, ref=event.head_sha)
+                content = await mcp_client.get_file_contents(candidate, ref=ref)
             except Exception:
                 continue
             if not content:
@@ -194,6 +195,56 @@ def _extract_full_file(response_text: str) -> str | None:
     return text if text else None
 
 
+def _strip_unused_imports(content: str) -> str:
+    """Deterministically remove imports the fix left unused.
+
+    LLMs reliably leave a dangling import when they switch approaches mid-fix
+    (e.g. `Decimal(...)` → `float(...)` but keep `from decimal import Decimal`),
+    which fails linters (Ruff F401) even though the real fix is correct. A tool
+    is perfect at this where the model is not. Conservative: only removes an
+    import statement when EVERY name it binds appears nowhere else in the file
+    (word-boundary match, so usage in string/forward-ref annotations still
+    counts as "used" and is kept). Never raises — returns the input on any
+    trouble (e.g. the file doesn't parse)."""
+    try:
+        tree = ast.parse(content)
+    except (SyntaxError, ValueError):
+        return content
+    drop_lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        # `from __future__ import ...` is semantically required even though the
+        # names are never referenced — never touch it.
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            continue
+        bound: list[str] = []
+        star = False
+        for alias in node.names:
+            if alias.name == "*":
+                star = True
+                break
+            bound.append((alias.asname or alias.name).split(".")[0])
+        if star or not bound:
+            continue
+        # A name is "used" if it appears as a word more than the single time it
+        # appears in this import statement.
+        all_unused = all(
+            len(re.findall(rf"\b{re.escape(name)}\b", content)) <= 1 for name in bound
+        )
+        if all_unused:
+            start = node.lineno
+            end = getattr(node, "end_lineno", None) or node.lineno
+            drop_lines.update(range(start, end + 1))
+    if not drop_lines:
+        return content
+    kept = [
+        line for i, line in enumerate(content.splitlines(keepends=True), start=1)
+        if i not in drop_lines
+    ]
+    return "".join(kept)
+
+
 def _synthesize_diff(original: str, new_content: str, path: str) -> str:
     """Build a unified diff that whatthepatch will apply cleanly."""
     if original.endswith("\n") and not new_content.endswith("\n"):
@@ -216,12 +267,18 @@ async def patch(
     attempt_number: int,
     mcp_client: GitHubMCPClient,
     failing_log: str | None = None,
+    base_ref: str | None = None,
 ) -> PatchResult:
+    # On a retry, base_ref points at the fix branch (the previous attempt's
+    # committed state) so the model sees what it actually produced and the new
+    # CI error is coherent. The first attempt patches the original failing commit.
+    ref = base_ref or event.head_sha
     logger.info(
-        "code_patcher: run=%d attempt=%d file=%s",
+        "code_patcher: run=%d attempt=%d file=%s ref=%s",
         event.run_id,
         attempt_number,
         diagnosis.file,
+        ref,
     )
 
     if diagnosis.file is None:
@@ -248,7 +305,7 @@ async def patch(
         )
 
     try:
-        file_content = await mcp_client.get_file_contents(diagnosis.file, ref=event.head_sha)
+        file_content = await mcp_client.get_file_contents(diagnosis.file, ref=ref)
     except GitHubMCPError as e:
         return PatchResult(
             branch_name="",
@@ -300,7 +357,7 @@ async def patch(
     if root:
         imports = _resolve_first_party_imports(diagnosis.file, file_content, root)
         imports = _rank_imports(imports, file_content, diagnosis.line_number)
-        referenced = await _fetch_import_context(imports, event, mcp_client)
+        referenced = await _fetch_import_context(imports, mcp_client, ref)
         for path, content in referenced:
             import_context += (
                 f"\n--- REFERENCED MODULE: {path} (read-only context; "
@@ -368,6 +425,12 @@ async def patch(
             attempt_number=attempt_number,
             error_message="Model signalled CANNOT_PATCH or response unparseable",
         )
+    # Deterministic safety net: strip any import the fix left unused (Ruff F401)
+    # before we commit — the model is unreliable at this, a tool is not.
+    stripped = _strip_unused_imports(new_content)
+    if stripped != new_content:
+        logger.info("code_patcher: stripped unused import(s) from the fix")
+        new_content = stripped
     if new_content == file_content:
         return PatchResult(
             branch_name="",
@@ -406,6 +469,7 @@ async def patch(
             run_id=event.run_id,
             head_sha=event.head_sha,
             mcp_client=mcp_client,
+            base_ref=ref,
         )
     except Exception as e:
         logger.error("code_patcher: apply_patch_set error: %s", e)
@@ -473,7 +537,17 @@ async def patch_and_verify(
             settings.patch_verify_max_iterations,
         )
         retry_log = verdict.failing_log or current_log
-        retry = await patch(diagnosis, event, attempt_number, mcp_client, retry_log)
+        # Retry against the fix branch (the previous attempt's state), not the
+        # pristine original — so the failing CI output we feed back matches the
+        # code the model is now looking at.
+        retry = await patch(
+            diagnosis,
+            event,
+            attempt_number,
+            mcp_client,
+            retry_log,
+            base_ref=ROLLING_PATCH_BRANCH,
+        )
         if not retry.success:
             # Couldn't produce a new fix (e.g. model returned the file unchanged).
             # Keep the PR we have, but report it honestly as still failing.
