@@ -20,7 +20,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import Any
 
+from agents import event_publisher
 from audit.context import clear_run_context, set_run_context
 from audit.logger import audit_step, get_audit_logger
 from config.constants import ROLLING_PATCH_BRANCH, PipelineStep, TaskState
@@ -38,6 +40,32 @@ from orchestrator.run_registry import get_registry
 logger = logging.getLogger("cicd_agent.pipeline")
 
 
+async def _publish(
+    event: WorkflowFailureEvent,
+    stage: str,
+    message: str,
+    *,
+    level: str = "info",
+    meta: dict[str, Any] | None = None,
+) -> None:
+    """Push one CI-pipeline reasoning event to the dashboard (fire-and-forget).
+
+    Mirrors orchestrator.cd_pipeline._publish: stamps run_id / repo / branch /
+    sha onto every event so the frontend can stitch the full story together.
+    Never raises — event_publisher.publish_safe swallows all errors, and the
+    call is a silent no-op when the backend URL / token are unset (tests, CI).
+    """
+    base: dict[str, Any] = {
+        "run_id": event.run_id,
+        "repo": event.full_repo,
+        "branch": event.branch,
+        "sha": event.short_sha,
+    }
+    if meta:
+        base.update(meta)
+    await event_publisher.publish_safe(stage, message, level=level, metadata=base)  # type: ignore[arg-type]
+
+
 def _pipeline_outcome(task: AgentTask) -> str:
     """Reduce the task's final state to a single label for metrics."""
     if task.flakiness_verdict is not None and task.flakiness_verdict.is_flaky:
@@ -51,7 +79,10 @@ def _pipeline_outcome(task: AgentTask) -> str:
     # Dedup gate sets attempt_number=0 on patch_result to signal "didn't try, commented".
     if task.patch_result is not None and task.patch_result.attempt_number == 0:
         return "deduped"
-    if task.state == TaskState.DONE:
+    # The happy path sets DONE and then transitions to NOTIFYING for the final
+    # send; by the time _pipeline_outcome runs in the `finally`, a non-escalated,
+    # non-flaky run that reached the notify step has completed its work.
+    if task.state in (TaskState.DONE, TaskState.NOTIFYING):
         return "success"
     return "unknown"
 
@@ -69,15 +100,31 @@ async def run_pipeline(event: WorkflowFailureEvent) -> None:
         event.branch,
     )
 
+    # Patch verification waits on the fix PR's live CI run, which legitimately
+    # takes minutes — so it gets its own budget ON TOP of the base session
+    # timeout, or the timeout would kill the pipeline mid-verify.
+    verify_budget = (
+        settings.patch_verify_timeout_seconds * (settings.patch_verify_max_iterations + 1)
+        if settings.patch_verify_enabled
+        else 0
+    )
+    effective_timeout = settings.session_timeout_seconds + verify_budget
+
     try:
-        async with asyncio.timeout(settings.session_timeout_seconds):
+        async with asyncio.timeout(effective_timeout):
             await _execute_pipeline(task, event, settings, start_time)
     except asyncio.TimeoutError:
         task.set_state(TaskState.TIMED_OUT)
         logger.error(
             "Pipeline timed out after %ds for run %d",
-            settings.session_timeout_seconds,
+            effective_timeout,
             event.run_id,
+        )
+        await _publish(
+            event,
+            "timeout",
+            f"Pipeline timed out after {effective_timeout}s",
+            level="error",
         )
         try:
             get_audit_logger().log_step(
@@ -107,6 +154,9 @@ async def run_pipeline(event: WorkflowFailureEvent) -> None:
             e,
             exc_info=True,
         )
+        # Surface only the exception class to the dashboard — the message can
+        # carry log/file fragments we must not leak (CLAUDE.md security rules).
+        await _publish(event, "error", f"Pipeline error: {type(e).__name__}", level="error")
         try:
             err_for_audit = e if isinstance(e, Exception) else Exception(repr(e))
             get_audit_logger().log_error(event.run_id, "pipeline_fatal", err_for_audit)
@@ -128,6 +178,14 @@ async def run_pipeline(event: WorkflowFailureEvent) -> None:
             task.state,
             duration,
         )
+        done_level = "success" if outcome in {"success", "flaky", "deduped"} else "warn"
+        await _publish(
+            event,
+            "done",
+            f"Pipeline finished: {outcome} ({duration:.1f}s)",
+            level=done_level,
+            meta={"outcome": outcome},
+        )
         clear_run_context()
 
 
@@ -139,11 +197,20 @@ async def _execute_pipeline(
 ) -> None:
     registry = get_registry()
     task.set_state(TaskState.RUNNING)
+    await _publish(
+        event,
+        "received",
+        f"CI failure detected on {event.full_repo} @ {event.short_sha} ({event.branch})",
+        level="warn",
+    )
 
     # ── Step 1: Deduplication ──────────────────────────────────────────────
     async with audit_step(event.run_id, PipelineStep.DEDUP_CHECK):
         if registry.is_duplicate(event.run_id):
             logger.info("Pipeline: run %d already processed — skipping", event.run_id)
+            await _publish(
+                event, "dedup", f"Run {event.run_id} already processed — skipping"
+            )
             task.set_state(TaskState.DONE)
             task.mark_step_done(PipelineStep.DEDUP_CHECK)
             return
@@ -152,33 +219,79 @@ async def _execute_pipeline(
     async with GitHubMCPClient() as mcp:
         # ── Step 2: Fetch logs ─────────────────────────────────────────────
         async with audit_step(event.run_id, "fetch_logs"):
+            await _publish(event, "fetch_logs", "Fetching failed-job logs from GitHub…")
             job_logs = await fetch_job_logs(event.run_id, mcp)
             if not job_logs:
+                await _publish(
+                    event,
+                    "fetch_logs",
+                    "No failed-job logs found — escalating to a human",
+                    level="warn",
+                )
                 task.escalate("No failed job logs found")
                 registry.mark_run_processed(event.run_id, "escalated")
                 await _send_notification(task, start_time)
                 return
+            await _publish(
+                event,
+                "fetch_logs",
+                f"Pulled logs from {len(job_logs)} failed job(s)",
+                level="success",
+            )
 
         # ── Step 3: Flakiness check ────────────────────────────────────────
         from agents.flakiness_detector import check as flakiness_check
         async with audit_step(event.run_id, PipelineStep.FLAKINESS_CHECK):
             task.set_state(TaskState.DIAGNOSING)
+            await _publish(
+                event, "flakiness", "Checking whether this failure is flaky or genuine…"
+            )
             verdict = await flakiness_check(event, job_logs, mcp)
             task.flakiness_verdict = verdict
             task.mark_step_done(PipelineStep.FLAKINESS_CHECK)
 
         if not verdict.should_patch:
+            await _publish(
+                event,
+                "flakiness",
+                f"Classified as flaky — no code fix needed ({verdict.reason})",
+                level="success",
+                meta={"pass_rate": verdict.pass_rate},
+            )
             registry.mark_run_processed(event.run_id, "done")
             task.set_state(TaskState.DONE)
             await _send_notification(task, start_time)
             return
 
+        await _publish(
+            event,
+            "flakiness",
+            "Genuine failure (not flaky) — proceeding to root-cause analysis",
+        )
+
         # ── Step 4: Log analysis ───────────────────────────────────────────
         from agents.log_analyst import diagnose
         async with audit_step(event.run_id, PipelineStep.LOG_ANALYSIS):
             task.set_state(TaskState.DIAGNOSING)
+            await _publish(
+                event, "diagnosis", "Analysing logs with Gemini to find the root cause…"
+            )
             diagnosis = await diagnose(job_logs, event, mcp_client=mcp)
             task.diagnosis = diagnosis
+            if diagnosis is not None:
+                etype = getattr(diagnosis.error_type, "value", str(diagnosis.error_type))
+                await _publish(
+                    event,
+                    "diagnosis",
+                    f"Root cause: {etype} in {diagnosis.file or '?'}:{diagnosis.line_number} "
+                    f"(confidence {diagnosis.confidence:.2f})",
+                    level="success",
+                    meta={
+                        "confidence": diagnosis.confidence,
+                        "error_type": etype,
+                        "file": diagnosis.file,
+                    },
+                )
             task.mark_step_done(PipelineStep.LOG_ANALYSIS)
 
         async with audit_step(event.run_id, PipelineStep.CONFIDENCE_GATE):
@@ -188,15 +301,26 @@ async def _execute_pipeline(
                     if diagnosis is None
                     else f"Low confidence: {diagnosis.confidence:.2f}"
                 )
+                await _publish(
+                    event, "confidence_gate", f"Escalating to a human — {reason}", level="warn"
+                )
                 task.escalate(reason)
                 registry.mark_run_processed(event.run_id, "escalated")
                 task.mark_step_done(PipelineStep.CONFIDENCE_GATE)
                 await _send_notification(task, start_time)
                 return
+            await _publish(
+                event,
+                "confidence_gate",
+                f"Confidence {diagnosis.confidence:.2f} clears the bar — attempting an automated fix",
+            )
             task.mark_step_done(PipelineStep.CONFIDENCE_GATE)
 
         # ── Step 5: Attempt gate + dedup + patch ───────────────────────────
-        from agents.code_patcher import patch as do_patch
+        # patch_and_verify opens the fix PR, then watches its CI and retries
+        # with feedback while it stays red — so a "fix" is only reported when
+        # its CI actually passes.
+        from agents.code_patcher import patch_and_verify as do_patch
         async with audit_step(event.run_id, PipelineStep.ATTEMPT_GATE):
             error_hash = diagnosis.error_hash
             set_run_context(error_hash=error_hash)
@@ -220,6 +344,12 @@ async def _execute_pipeline(
                         await rest_api.post_issue_comment(pr_number, comment)
                     except Exception as e:
                         logger.warning("dedup: comment failed for PR #%d: %s", pr_number, e)
+                    await _publish(
+                        event,
+                        "code_patch",
+                        f"Same error already addressed by open PR #{pr_number} — commented there instead",
+                        meta={"pr": pr_number},
+                    )
                     task.patch_result = PatchResult(
                         branch_name=ROLLING_PATCH_BRANCH,
                         success=True,
@@ -246,6 +376,13 @@ async def _execute_pipeline(
 
             attempt_count = registry.get_attempt_count(error_hash)
             if registry.is_escalated(error_hash) or attempt_count >= settings.max_patch_attempts:
+                await _publish(
+                    event,
+                    "attempt_gate",
+                    f"Max patch attempts reached "
+                    f"({attempt_count}/{settings.max_patch_attempts}) — escalating to a human",
+                    level="warn",
+                )
                 task.escalate(
                     f"Max patch attempts reached "
                     f"({attempt_count}/{settings.max_patch_attempts})"
@@ -258,6 +395,11 @@ async def _execute_pipeline(
 
         async with audit_step(event.run_id, PipelineStep.CODE_PATCH):
             task.set_state(TaskState.PATCHING)
+            await _publish(
+                event,
+                "code_patch",
+                f"Generating a fix and opening a pull request (attempt {attempt_count + 1})…",
+            )
             registry.increment_attempt(error_hash)
             # Hand the patcher the failing log so it can read the failing test(s)
             # and satisfy every assertion (including boundary cases), not just the
@@ -288,14 +430,61 @@ async def _execute_pipeline(
                 # next webhook to try again — otherwise one transient gemini /
                 # diff-apply hiccup permanently blocks the hash.
                 registry.mark_escalated(error_hash)
+            if patch_result.success:
+                if patch_result.verified is True:
+                    pr_msg = f"Fix PR #{patch_result.pr_number} verified — its CI passed"
+                    pr_level = "success"
+                elif patch_result.verified is False:
+                    pr_msg = (
+                        f"Fix PR #{patch_result.pr_number} opened but its CI is still "
+                        f"failing — needs human review"
+                    )
+                    pr_level = "warn"
+                else:
+                    pr_msg = f"Fix PR #{patch_result.pr_number} opened (CI not confirmed)"
+                    pr_level = "info"
+                await _publish(
+                    event,
+                    "code_patch",
+                    pr_msg,
+                    level=pr_level,
+                    meta={
+                        "pr": patch_result.pr_number,
+                        "pr_url": patch_result.pr_url,
+                        "verified": patch_result.verified,
+                    },
+                )
+            else:
+                await _publish(
+                    event,
+                    "code_patch",
+                    f"Patch attempt failed — {patch_result.error_message or 'unknown error'}",
+                    level="error",
+                )
             task.mark_step_done(PipelineStep.CODE_PATCH)
 
         # ── Step 6: YAML optimization ──────────────────────────────────────
         from agents.yaml_optimizer import optimize
         async with audit_step(event.run_id, PipelineStep.YAML_OPTIMIZE):
             task.set_state(TaskState.OPTIMIZING)
+            await _publish(
+                event, "yaml_optimize", "Optimising the workflow YAML for faster CI runs…"
+            )
             opt_result = await optimize(event, mcp)
             task.optimization_result = opt_result
+            if opt_result is not None and opt_result.pr_number:
+                await _publish(
+                    event,
+                    "yaml_optimize",
+                    f"Workflow optimization PR opened: #{opt_result.pr_number} "
+                    f"(saves ~{opt_result.savings_display})",
+                    level="success",
+                    meta={"pr": opt_result.pr_number, "pr_url": opt_result.pr_url},
+                )
+            else:
+                await _publish(
+                    event, "yaml_optimize", "No worthwhile workflow optimizations found"
+                )
             task.mark_step_done(PipelineStep.YAML_OPTIMIZE)
 
         # ── Step 7: Notify + finish ────────────────────────────────────────
@@ -325,4 +514,11 @@ async def _send_notification(task: AgentTask, start_time: float) -> None:
             escalation_reason=base.escalation_reason,
         )
         task.notification_sent = await notify(payload)
+        if task.event is not None:
+            await _publish(
+                task.event,
+                "notify",
+                "Notification sent" if task.notification_sent else "Notification could not be sent",
+                level="info" if task.notification_sent else "warn",
+            )
         task.mark_step_done(PipelineStep.NOTIFY)

@@ -94,12 +94,20 @@ explanation, no diff syntax, nothing outside the single code block.
 
 Rules:
 - Make the minimum change required to resolve the diagnosed error. Nothing more.
-- When failing test output and/or the test file are provided, your fix MUST satisfy
-  EVERY assertion in those tests — not just the first one that failed. Pay special
-  attention to boundary/edge cases: a value exactly at a threshold, an inclusive vs
-  exclusive comparison (`<` vs `<=`), off-by-one limits. Read the expected values and
-  any inline comments (e.g. "at threshold counts as low") and make the comparison
-  match ALL of them. A fix that passes one assertion but breaks another is wrong.
+- When failing output is provided (test assertions, type-checker/linter/build
+  errors), your fix MUST make ALL of those specific errors go away — not just the
+  first one. For failing tests, satisfy EVERY assertion, paying special attention to
+  boundary/edge cases (a value exactly at a threshold, `<` vs `<=`, off-by-one) and
+  any inline comments stating expected behaviour. A fix that resolves one error but
+  leaves or introduces another is wrong.
+- The failing file's imported first-party modules may be included below under
+  `--- REFERENCED MODULE: <path> ---`. They are READ-ONLY context. When the error is
+  a mismatch with something DECLARED elsewhere — an incompatible assignment, an
+  argument-type or return-type mismatch, a wrong/renamed attribute, a changed
+  signature — read those declarations and make your change CONSISTENT with the
+  target's declared type/signature (e.g. convert the value to the type the target
+  expects), rather than guessing. Do not assume the flagged line is wrong when the
+  real mismatch is with a declaration you can see.
 - Never reformat unrelated code, rename symbols, change unrelated lines, or "drive-by
   clean up" anything outside the failure site.
 - The implicit diff between the original and your output must not delete more than
@@ -112,7 +120,9 @@ Rules:
   infra-level errors, ambiguous root cause, or any case where the change would exceed
   the deletion limit — output exactly the single token CANNOT_PATCH and nothing else.
 
-You only get one attempt per run.
+If your previous attempt's failing output is included above, it means your last
+change did NOT fix the problem — read it carefully and correct what that change got
+wrong, do not repeat the same edit.
 """
 
 YAML_OPTIMIZER_SYSTEM_PROMPT: Final[str] = """\
@@ -155,6 +165,11 @@ Tone: a matter-of-fact senior engineer posting in Slack. Lead with what happened
 pleasantries. Mention the failing file and line if known. Always include any PR link
 inline as a raw URL. If the run was flaky, say so directly and note that patching was
 skipped. If the run was escalated, name the reason.
+
+Be precise about the fix's status using `patch_verified`: only call the fix confirmed
+or passing when `patch_verified` is true (its CI went green); when it is false, say the
+PR was opened but its CI is still failing and needs review; when it is null, say a PR
+was opened but CI was not confirmed. Never imply the bug is fixed unless verified.
 """
 
 DEPLOY_GUARD_SYSTEM_PROMPT: Final[str] = """\
@@ -216,7 +231,7 @@ empty or unreadable, return approve=false with a reason that says so.
 
 SYSTEM_PROMPT_VERSIONS: Final[dict[str, str]] = {
     "log_analyst": "1.0",
-    "code_patcher": "1.1",  # multi-file diff support
+    "code_patcher": "1.2",  # multi-file diff + referenced-module context + CI-verified retry
     "yaml_optimizer": "1.0",
     "notifier": "1.0",
     "deploy_guard": "1.0",

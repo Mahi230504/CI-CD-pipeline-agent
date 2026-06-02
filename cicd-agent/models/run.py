@@ -84,4 +84,14 @@ class PatchResult:
     pr_number: int | None = None
     diff: str | None = None
     error_message: str | None = None
+    # SHA of the commit this patch pushed onto the fix branch. Used to find the
+    # PR's own CI run when verifying the fix. None for the dedup-comment path.
+    head_sha: str | None = None
+    # Did the fix PR's CI go green? True = verified passing, False = CI still
+    # red after all attempts, None = not checked / could not confirm in time
+    # (verification disabled, no CI run found, or timed out). Drives honest
+    # reporting — only True earns a "[FIXED]" label.
+    verified: bool | None = None
+    # One short human-readable line about how verification concluded.
+    verification_detail: str | None = None
     patched_at: datetime = field(default_factory=_now)

@@ -93,6 +93,24 @@ class Settings:
     # Default to enabling rollback because that's the demoable behaviour.
     auto_rollback_enabled: bool = True
 
+    # ── Patch verification (close the fix→verify loop) ───────────────────
+    # After opening/updating the fix PR, watch that PR's OWN CI run and only
+    # report the failure as fixed when CI goes green. When it stays red, the
+    # patcher re-attempts using the new failing output as feedback, up to
+    # patch_verify_max_iterations extra tries. False = open the PR and report
+    # it as unverified (the pre-verification behaviour), no waiting.
+    patch_verify_enabled: bool = True
+    # Hard cap (seconds) on waiting for ONE patch CI run to reach a verdict —
+    # covers both the time for the run to appear and to complete. On expiry the
+    # patch is reported as unverified rather than fixed.
+    patch_verify_timeout_seconds: int = 240
+    # Extra re-patch attempts after the first, each fed the prior run's failing
+    # output. 1 ⇒ up to two patch attempts total per pipeline run. Bounded
+    # independently of max_patch_attempts (which counts across webhooks).
+    patch_verify_max_iterations: int = 1
+    # Seconds between CI status polls while verifying.
+    patch_verify_poll_interval_seconds: float = 6.0
+
     @property
     def github_mcp_url(self) -> str:
         return "https://api.githubcopilot.com/mcp"
@@ -237,6 +255,12 @@ def get_settings() -> Settings:
             "DEPLOY_HEALTH_POLL_INTERVAL_SECONDS", 3.0
         ),
         auto_rollback_enabled=_bool_env("AUTO_ROLLBACK_ENABLED", True),
+        patch_verify_enabled=_bool_env("PATCH_VERIFY_ENABLED", True),
+        patch_verify_timeout_seconds=_int_env("PATCH_VERIFY_TIMEOUT_SECONDS", 240),
+        patch_verify_max_iterations=_int_env("PATCH_VERIFY_MAX_ITERATIONS", 1),
+        patch_verify_poll_interval_seconds=_float_env(
+            "PATCH_VERIFY_POLL_INTERVAL_SECONDS", 6.0
+        ),
     )
     print(
         f"⚙ Settings loaded: repo={settings.full_repo_name}, "

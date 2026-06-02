@@ -58,6 +58,10 @@ async def send(payload: NotificationPayload) -> bool:
         "error_type": str(payload.diagnosis.error_type) if payload.diagnosis else None,
         "explanation": payload.diagnosis.explanation if payload.diagnosis else None,
         "patch_success": payload.patch_result.success if payload.patch_result else None,
+        "patch_verified": payload.patch_result.verified if payload.patch_result else None,
+        "patch_verification_detail": (
+            payload.patch_result.verification_detail if payload.patch_result else None
+        ),
         "patch_pr_url": payload.patch_result.pr_url if payload.patch_result else None,
         "optimization_pr_url": payload.optimization_result.pr_url if payload.optimization_result else None,
         "time_saved": payload.optimization_result.savings_display if payload.optimization_result else None,

@@ -453,6 +453,7 @@ async def apply_patch_set(
             pr_url=pr_url if isinstance(pr_url, str) else None,
             pr_number=pr_number if isinstance(pr_number, int) else None,
             diff=diff,
+            head_sha=new_sha,
         )
 
     title = f"[agent] auto-fixes ({diagnosis.error_type})"
@@ -500,6 +501,7 @@ async def apply_patch_set(
         pr_url=pr_url,
         pr_number=pr_number,
         diff=diff,
+        head_sha=new_sha,
     )
 
 

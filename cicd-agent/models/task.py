@@ -83,8 +83,31 @@ class NotificationPayload:
             return f"[FLAKY] {self.repo_full_name} #{self.run_id} on {self.branch} — skipped patching"
         if self.escalated:
             return f"[ESCALATED] {self.repo_full_name} #{self.run_id} — {self.escalation_reason}"
-        if self.patch_result and self.patch_result.success:
-            return f"[FIXED] {self.repo_full_name} #{self.run_id} — PR: {self.patch_result.pr_url}"
+        pr = self.patch_result
+        if pr and pr.success:
+            # attempt_number == 0 signals the dedup path: we commented on an
+            # already-open PR rather than opening/patching anew.
+            if pr.attempt_number == 0:
+                return (
+                    f"[DUPLICATE] {self.repo_full_name} #{self.run_id} — "
+                    f"same error already addressed by PR: {pr.pr_url}"
+                )
+            # Honest labelling: only a green CI run earns "[FIXED]". A PR that
+            # opened but didn't pass CI is explicitly flagged for review rather
+            # than reported as a fix (which it isn't).
+            if pr.verified is True:
+                return f"[FIXED] {self.repo_full_name} #{self.run_id} — CI passed — PR: {pr.pr_url}"
+            if pr.verified is False:
+                return (
+                    f"[PATCH NEEDS REVIEW] {self.repo_full_name} #{self.run_id} — "
+                    f"PR opened but its CI is still failing — PR: {pr.pr_url}"
+                )
+            # verified is None: opened but CI not confirmed (verification off,
+            # no CI run found, or timed out). Don't over-claim.
+            return (
+                f"[PATCH OPENED] {self.repo_full_name} #{self.run_id} — "
+                f"CI not confirmed — PR: {pr.pr_url}"
+            )
         return f"[FAILED] {self.repo_full_name} #{self.run_id} on {self.branch} — patch unsuccessful"
 
 
