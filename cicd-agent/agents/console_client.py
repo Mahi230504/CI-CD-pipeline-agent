@@ -68,6 +68,11 @@ class ConsoleApiClient:
         deploy_config, autonomy_mode, live_url."""
         return await self._request("GET", "/repo")
 
+    async def get_turn(self, turn_id: str) -> dict[str, Any] | None:
+        """Turn state (status, pr_number, run_id, autonomy) — used to resume a
+        paused turn on approve/reject."""
+        return await self._request("GET", f"/turns/{turn_id}")
+
     async def patch_turn(self, turn_id: str, **fields: Any) -> bool:
         body = {k: v for k, v in fields.items() if v is not None}
         return await self._request("PATCH", f"/turns/{turn_id}", json=body) is not None

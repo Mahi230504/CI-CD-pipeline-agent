@@ -58,6 +58,10 @@ def test_missing_required_raises() -> None:
 
 
 def test_edit_proposal_actionable() -> None:
-    assert EditProposal(diff="d", files=["a.py"], summary="s").is_actionable is True
+    p = EditProposal(file_contents={"a.py": "x = 1\n"}, diff="d", summary="s")
+    assert p.is_actionable is True
+    assert p.files == ["a.py"]
     assert EditProposal().is_actionable is False
-    assert EditProposal(diff="d", files=["a.py"], cannot_reason="blocked").is_actionable is False
+    assert EditProposal(
+        file_contents={"a.py": "x"}, cannot_reason="blocked"
+    ).is_actionable is False

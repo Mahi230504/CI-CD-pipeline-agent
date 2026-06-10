@@ -88,15 +88,23 @@ class ChatTaskEvent:
 
 @dataclass
 class EditProposal:
-    """The chat editor's output: a unified diff plus the paths it touches and a
-    short human summary. ``cannot_reason`` is set when the editor declines (the
-    instruction is out of scope, or it would touch a blocked path)."""
+    """The chat editor's output.
 
+    ``file_contents`` maps path → full new file content (the editor returns whole
+    files, so we commit them directly — robust for NEW files where there's no
+    original to apply hunks against). ``diff`` is a synthesized unified diff for
+    DISPLAY only. ``cannot_reason`` is set when the editor declines (out of
+    scope, or it would touch a blocked path)."""
+
+    file_contents: dict[str, str] = field(default_factory=dict)
     diff: str = ""
-    files: list[str] = field(default_factory=list)
     summary: str = ""
     cannot_reason: str | None = None
 
     @property
+    def files(self) -> list[str]:
+        return list(self.file_contents.keys())
+
+    @property
     def is_actionable(self) -> bool:
-        return bool(self.diff and self.files and self.cannot_reason is None)
+        return bool(self.file_contents and self.cannot_reason is None)

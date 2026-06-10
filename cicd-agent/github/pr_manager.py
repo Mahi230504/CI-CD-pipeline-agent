@@ -513,6 +513,84 @@ async def apply_patch_set(
     )
 
 
+async def open_feature_pr(
+    *,
+    branch: str,
+    files: dict[str, str],
+    title: str,
+    body: str,
+    mcp_client: GitHubMCPClient,
+    base_branch: str = _DEFAULT_BRANCH,
+) -> PatchResult:
+    """Open a PR from a FRESH per-turn branch with full file contents.
+
+    Used by the chat orchestrator. Unlike apply_patch_set (which applies a diff
+    to the rolling CI branch), this commits whole files to a new branch — robust
+    for NEW files (no original to apply hunks against) and isolated per turn so a
+    chat change never collides with the CI auto-fix PR. Enforces the same
+    blocked-path guard. Returns a PatchResult; success=False on any failure.
+    """
+    if not files:
+        return PatchResult(branch_name=branch, success=False, attempt_number=1,
+                           error_message="no files to commit")
+    for path in files:
+        if is_file_blocked(path):
+            return PatchResult(branch_name=branch, success=False, attempt_number=1,
+                               error_message=f"blocked path: {path}")
+
+    base_sha = await rest_api.get_branch_sha(base_branch)
+    if base_sha is None:
+        return PatchResult(branch_name=branch, success=False, attempt_number=1,
+                           error_message=f"base branch {base_branch} not found")
+
+    # Create the branch if new; append if it already exists (idempotent resume).
+    existing = await rest_api.get_branch_sha(branch)
+    if existing is None:
+        try:
+            await mcp_client.create_branch(branch, base_sha)
+        except GitHubMCPError as e:
+            return PatchResult(branch_name=branch, success=False, attempt_number=1,
+                               error_message=f"create_branch failed: {e}")
+        parent_sha = base_sha
+    else:
+        parent_sha = existing
+
+    new_sha = await rest_api.create_atomic_commit(
+        branch=branch, files=files, message=title, parent_sha=parent_sha
+    )
+    if new_sha is None:
+        return PatchResult(branch_name=branch, success=False, attempt_number=1,
+                           error_message="atomic commit failed")
+
+    open_pr = await rest_api.find_open_pr_by_head(branch)
+    pr_number = open_pr.get("number") if isinstance(open_pr, dict) else None
+    pr_url = open_pr.get("html_url") if isinstance(open_pr, dict) else None
+
+    if pr_number is None:
+        try:
+            pr = await mcp_client.create_pull_request(title=title, body=body, head=branch)
+        except GitHubMCPError as e:
+            return PatchResult(branch_name=branch, success=False, attempt_number=1,
+                               error_message=f"create_pull_request failed: {e}", head_sha=new_sha)
+        pr_number = pr.get("number") if isinstance(pr.get("number"), int) else None
+        pr_url = pr.get("html_url") if isinstance(pr.get("html_url"), str) else None
+        # MCP response shape varies — fall back to REST for number/url.
+        if pr_number is None or pr_url is None:
+            fresh = await rest_api.find_open_pr_by_head(branch)
+            if isinstance(fresh, dict):
+                pr_number = pr_number or (fresh.get("number") if isinstance(fresh.get("number"), int) else None)
+                pr_url = pr_url or (fresh.get("html_url") if isinstance(fresh.get("html_url"), str) else None)
+
+    return PatchResult(
+        branch_name=branch,
+        success=True,
+        attempt_number=1,
+        pr_url=pr_url if isinstance(pr_url, str) else None,
+        pr_number=pr_number if isinstance(pr_number, int) else None,
+        head_sha=new_sha,
+    )
+
+
 # ───────────────────────────── YAML optimize PR (unchanged shape) ─────────────
 
 

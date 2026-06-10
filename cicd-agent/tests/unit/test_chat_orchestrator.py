@@ -1,94 +1,171 @@
-"""Slice-3 tests: the ChatOrchestrator turn lifecycle (skeleton).
+"""Slice-4 functional tests: the ChatOrchestrator feature pipeline.
 
-Uses a fake ConsoleApiClient (no HTTP) and stubs event_publisher.publish_safe
-so nothing touches the real .env / backend (dotenv-isolation hazard).
+Fakes every collaborator (editor, PR open, verify, guard, merge, deploy, LLM)
+plus a fake MCP factory and ConsoleApiClient, and stubs event_publisher — so the
+real control flow + the AUTO gate (real autonomy_policy + real pr_risk) run with
+no network, no LLM, no .env-driven SSH (deployer.deploy is faked unconditionally).
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from agents import chat_orchestrator as co_module
+from agents import chat_orchestrator as co
 from agents.chat_orchestrator import ChatOrchestrator
-from models.chat import ChatTaskEvent
+from models.chat import ChatTaskEvent, EditProposal
 
 
 class FakeClient:
-    def __init__(self, fail_on_message: bool = False) -> None:
+    def __init__(self) -> None:
         self.turn_patches: list[dict] = []
+        self.run_patches: list[dict] = []
         self.messages: list[dict] = []
-        self.fail_on_message = fail_on_message
-
-    async def patch_turn(self, turn_id: str, **fields) -> bool:
-        self.turn_patches.append({"turn_id": turn_id, **fields})
-        return True
-
-    async def patch_run(self, run_id: str, **fields) -> bool:
-        return True
-
-    async def post_message(self, conversation_id: str, **kw) -> bool:
-        if self.fail_on_message:
-            raise RuntimeError("boom")
-        self.messages.append({"conversation_id": conversation_id, **kw})
-        return True
+        self.turn_state: dict = {}
 
     async def get_repo(self):
-        return {"owner": "o", "name": "n"}
+        return {
+            "owner": "o", "name": "n", "default_branch": "main",
+            "ci_workflow_name": "CI", "live_url": "https://demo.example",
+        }
+
+    async def get_turn(self, turn_id):
+        return self.turn_state
+
+    async def patch_turn(self, turn_id, **f):
+        self.turn_patches.append(f)
+        return True
+
+    async def patch_run(self, run_id, **f):
+        self.run_patches.append(f)
+        return True
+
+    async def post_message(self, conversation_id, **kw):
+        self.messages.append(kw)
+        return True
 
 
-def _event(kind: str = "chat") -> ChatTaskEvent:
+class FakeMCP:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _event(kind="chat", autonomy="auto") -> ChatTaskEvent:
     return ChatTaskEvent(
-        tenant_id="tenant_1",
-        conversation_id="cnv_1",
-        turn_id="turn_1",
-        message="add endpoint",
-        autonomy="auto",
-        kind=kind,
-        run_id="run_1",
+        tenant_id="tenant_1", conversation_id="cnv_1", turn_id="turn_1",
+        message="add a low-stock endpoint", autonomy=autonomy, kind=kind, run_id="run_1",
     )
 
 
 @pytest.fixture(autouse=True)
-def _stub_publish(monkeypatch) -> list:
-    """Capture emitted events instead of POSTing them anywhere."""
-    captured: list[tuple] = []
+def _wire(monkeypatch):
+    """Fake all collaborators; keep autonomy_policy + pr_risk real."""
+    events: list[tuple] = []
 
-    async def fake_publish_safe(stage, message, *, level="info", metadata=None):
-        captured.append((stage, level, message))
+    async def fake_publish(stage, message, *, level="info", metadata=None):
+        events.append((stage, level))
 
-    monkeypatch.setattr(co_module.event_publisher, "publish_safe", fake_publish_safe)
-    return captured
+    async def fake_classify_llm(*a, **k):
+        return '{"intent":"feature","summary":"add a low-stock endpoint"}'
+
+    class FakeGemini:
+        async def generate(self, *a, **k):
+            return await fake_classify_llm()
+
+    async def fake_generate_edit(instruction, mcp, *, ref="main"):
+        return EditProposal(
+            file_contents={"app/api/low_stock.py": "def low_stock():\n    return []\n"},
+            diff="--- /dev/null\n+++ b/app/api/low_stock.py\n",
+            summary="add a low-stock endpoint",
+        )
+
+    async def fake_open_pr(**kw):
+        return SimpleNamespace(success=True, pr_number=7, pr_url="http://pr/7",
+                               head_sha="abcdef1", error_message=None, branch_name=kw["branch"])
+
+    async def fake_verify(*a, **k):
+        return SimpleNamespace(verified=True, detail="CI passed (run 99)", failing_log=None)
+
+    async def fake_judge(**kw):
+        return SimpleNamespace(approve=True, confidence=0.9, is_high_confidence=True, reason="safe")
+
+    merge_calls: list[int] = []
+
+    async def fake_merge(pr_number, *, merge_method="squash", sha=None):
+        merge_calls.append(pr_number)
+        return (True, "mergedsha123")
+
+    async def fake_deploy(image_tag):
+        return SimpleNamespace(success=True, error_message=None, image_tag=image_tag)
+
+    monkeypatch.setattr(co.event_publisher, "publish_safe", fake_publish)
+    monkeypatch.setattr(co, "get_gemini_client", lambda: FakeGemini())
+    monkeypatch.setattr(co.chat_editor, "generate_edit", fake_generate_edit)
+    monkeypatch.setattr(co.pr_manager, "open_feature_pr", fake_open_pr)
+    monkeypatch.setattr(co.ci_verifier, "verify_patch_ci", fake_verify)
+    monkeypatch.setattr(co.deploy_guard, "judge", fake_judge)
+    monkeypatch.setattr(co.rest_api, "merge_pull_request", fake_merge)
+    monkeypatch.setattr(co.deployer, "deploy", fake_deploy)
+    return SimpleNamespace(events=events, merge_calls=merge_calls)
 
 
-async def test_chat_turn_runs_then_done(_stub_publish) -> None:
+def _orch(client):
+    return ChatOrchestrator(client=client, mcp_factory=lambda: FakeMCP())
+
+
+async def test_auto_ships_end_to_end(_wire) -> None:
     client = FakeClient()
-    await ChatOrchestrator(client=client).handle_turn(_event("chat"))
+    await _orch(client).handle_turn(_event(autonomy="auto"))
 
-    statuses = [p.get("status") for p in client.turn_patches]
-    assert statuses[0] == "running"
+    statuses = [p["status"] for p in client.turn_patches if "status" in p]
+    assert "running" in statuses
+    assert "merging" in statuses
     assert statuses[-1] == "done"
-    assert any(m["kind"] == "status" for m in client.messages)
-    assert any(stage == "chat_received" for stage, _l, _m in _stub_publish)
+    assert _wire.merge_calls == [7]  # merged unattended
+    # The PR + a diff + a live-url/status message were surfaced.
+    kinds = [m.get("kind") for m in client.messages]
+    assert "diff" in kinds and ("live_url" in kinds or "status" in kinds)
+    # A run row recorded the PR + verification.
+    assert any(p.get("pr_number") == 7 for p in client.run_patches)
+    assert any(p.get("verified") is True for p in client.run_patches)
 
 
-async def test_approve_marks_done(_stub_publish) -> None:
+async def test_manual_pauses_for_approval(_wire) -> None:
     client = FakeClient()
-    await ChatOrchestrator(client=client).handle_turn(_event("approve"))
-    assert client.turn_patches[-1]["status"] == "done"
-    assert any(stage == "chat_approved" for stage, _l, _m in _stub_publish)
+    await _orch(client).handle_turn(_event(autonomy="manual"))
+
+    statuses = [p["status"] for p in client.turn_patches if "status" in p]
+    assert statuses[-1] == "awaiting_approval"
+    assert any(p.get("resume_token") for p in client.turn_patches)
+    assert _wire.merge_calls == []  # did NOT ship
+    assert any(m.get("kind") == "approval" for m in client.messages)
 
 
-async def test_reject_marks_rejected(_stub_publish) -> None:
+async def test_approve_resumes_and_ships(_wire) -> None:
     client = FakeClient()
-    await ChatOrchestrator(client=client).handle_turn(_event("reject"))
-    assert client.turn_patches[-1]["status"] == "rejected"
+    client.turn_state = {"status": "awaiting_approval", "pr_number": 7}
+    await _orch(client).handle_turn(_event(kind="approve", autonomy="manual"))
+    assert _wire.merge_calls == [7]
+    assert [p["status"] for p in client.turn_patches if "status" in p][-1] == "done"
 
 
-async def test_exception_fails_turn(_stub_publish) -> None:
-    client = FakeClient(fail_on_message=True)  # post_message raises mid-turn
-    await ChatOrchestrator(client=client).handle_turn(_event("chat"))
-    # handle_turn never raises; the turn ends FAILED with an error recorded.
-    last = client.turn_patches[-1]
-    assert last["status"] == "failed"
-    assert "error" in last
-    assert any(stage == "chat_error" for stage, _l, _m in _stub_publish)
+async def test_reject_marks_rejected(_wire) -> None:
+    client = FakeClient()
+    await _orch(client).handle_turn(_event(kind="reject"))
+    assert [p["status"] for p in client.turn_patches if "status" in p][-1] == "rejected"
+    assert _wire.merge_calls == []
+
+
+async def test_blocked_edit_fails_turn(_wire, monkeypatch) -> None:
+    async def cannot_edit(instruction, mcp, *, ref="main"):
+        return EditProposal(cannot_reason="would touch a protected path")
+
+    monkeypatch.setattr(co.chat_editor, "generate_edit", cannot_edit)
+    client = FakeClient()
+    await _orch(client).handle_turn(_event(autonomy="auto"))
+    assert [p["status"] for p in client.turn_patches if "status" in p][-1] == "failed"
+    assert _wire.merge_calls == []
