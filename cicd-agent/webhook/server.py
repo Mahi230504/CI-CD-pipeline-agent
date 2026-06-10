@@ -72,6 +72,15 @@ async def lifespan(app: FastAPI):
     if replayed:
         logger.info("Replayed %d unfinished event(s) from %s", replayed, settings.queue_db_path)
     await queue.start()
+
+    # Agent Console chat: start the Redis consumer that pulls chat turns and
+    # runs them through the ChatOrchestrator. No-op unless CHAT_ENABLED=true.
+    from orchestrator.chat_consumer import start_chat_consumer, stop_chat_consumer
+
+    try:
+        await start_chat_consumer()
+    except Exception as e:
+        logger.warning("chat_consumer failed to start (chat disabled this run): %s", e)
     logger.info("Webhook server lifespan started")
 
     try:
@@ -81,6 +90,10 @@ async def lifespan(app: FastAPI):
             await get_task_queue().stop()
         except Exception as e:
             logger.warning("task_queue stop failed: %s", e)
+        try:
+            await stop_chat_consumer()
+        except Exception as e:
+            logger.warning("chat_consumer stop failed: %s", e)
         logger.info("Server shutdown complete")
 
 

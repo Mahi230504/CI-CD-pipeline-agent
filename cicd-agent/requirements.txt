@@ -13,6 +13,9 @@ aiohttp>=3.10.0
 aiofiles>=24.1.0
 httpx>=0.27.0
 
+# Agent Console chat: Redis consumer for the agent:tasks stream
+redis>=5.0.0
+
 # Config
 python-dotenv>=1.0.0
 

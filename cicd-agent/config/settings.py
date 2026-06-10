@@ -128,6 +128,26 @@ class Settings:
     # Seconds between CI status polls while verifying.
     patch_verify_poll_interval_seconds: float = 6.0
 
+    # ── Agent Console (chat) ─────────────────────────────────────────────
+    # When true, the server starts a Redis consumer that pulls chat turns off
+    # the console's task stream and runs them through the ChatOrchestrator.
+    # Empty/false leaves the agent as a pure webhook worker (chat disabled).
+    chat_enabled: bool = False
+    # Redis broker shared with the demo backend (it XADDs chat turns here).
+    redis_url: str = "redis://localhost:6379/0"
+    # Stream + consumer-group the demo backend publishes chat turns onto.
+    chat_tasks_stream: str = "agent:tasks"
+    chat_consumer_group: str = "agent-chat"
+    chat_consumer_name: str = "agent-1"
+
+    @property
+    def console_internal_base(self) -> str:
+        """Base URL for the demo backend's agent-callback endpoints. Reuses
+        backend_base_url; empty when unconfigured (chat callbacks become no-ops)."""
+        if not self.backend_base_url:
+            return ""
+        return f"{self.backend_base_url_clean}/internal/console"
+
     @property
     def github_mcp_url(self) -> str:
         return "https://api.githubcopilot.com/mcp"
@@ -281,6 +301,11 @@ def get_settings() -> Settings:
         patch_verify_poll_interval_seconds=_float_env(
             "PATCH_VERIFY_POLL_INTERVAL_SECONDS", 6.0
         ),
+        chat_enabled=_bool_env("CHAT_ENABLED", False),
+        redis_url=_optional("REDIS_URL", "redis://localhost:6379/0"),
+        chat_tasks_stream=_optional("CHAT_TASKS_STREAM", "agent:tasks"),
+        chat_consumer_group=_optional("CHAT_CONSUMER_GROUP", "agent-chat"),
+        chat_consumer_name=_optional("CHAT_CONSUMER_NAME", "agent-1"),
     )
     print(
         f"⚙ Settings loaded: repo={settings.full_repo_name}, "
