@@ -114,6 +114,53 @@ async def post_issue_comment(issue_number: int, body: str) -> bool:
             return False
 
 
+async def merge_pull_request(
+    pr_number: int,
+    *,
+    merge_method: str = "squash",
+    sha: str | None = None,
+) -> tuple[bool, str]:
+    """Merge a PR. Returns (merged, detail).
+
+    DELIBERATE DEVIATION from cicd-agent/CLAUDE.md ("Do not merge PRs — agent
+    opens PRs, humans merge"): the Agent Console's AUTO toggle ships verified-
+    green + low-risk changes unattended, which requires merging. This is gated
+    HARD upstream by autonomy_policy.should_ship_unattended (autonomy==auto AND
+    CI verified green AND pr_risk LOW AND deploy_guard approved AND high
+    confidence); the webhook CI path never calls this. Approved by the project
+    owner for the Console feature.
+
+    Degrade-don't-fail: branch protection, lost merge rights, or a conflict
+    (403/405/409) return (False, reason) so the chat turn flips to
+    AWAITING_APPROVAL with that reason rather than raising. Never raises.
+    """
+    url = f"{_BASE}/repos/{_repo_path()}/pulls/{pr_number}/merge"
+    payload: dict[str, Any] = {"merge_method": merge_method}
+    if sha:
+        payload["sha"] = sha
+    try:
+        async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
+            async with session.put(url, headers=_headers(), json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    merged = bool(data.get("merged"))
+                    return (merged, str(data.get("sha", "")) if merged else "merge not confirmed")
+                detail = (await resp.text())[:200]
+                reasons = {
+                    403: "no permission to merge (PAT lacks rights / protected branch)",
+                    404: "PR or repo not found",
+                    405: "PR not mergeable (checks pending or merge blocked)",
+                    409: "head SHA out of date or merge conflict",
+                    422: "merge rejected (e.g. required reviews)",
+                }
+                reason = reasons.get(resp.status, f"merge failed (HTTP {resp.status})")
+                logger.warning("merge_pull_request #%d -> %d: %s", pr_number, resp.status, detail)
+                return (False, reason)
+    except Exception as e:  # network/timeout — degrade to pause, never raise
+        logger.warning("merge_pull_request #%d errored: %s", pr_number, e)
+        return (False, f"merge request errored: {type(e).__name__}")
+
+
 async def update_ref(branch: str, sha: str, force: bool = False) -> bool:
     """Fast-forward (or force-move) `branch` to point at `sha`."""
     url = f"{_BASE}/repos/{_repo_path()}/git/refs/heads/{branch}"

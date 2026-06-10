@@ -57,18 +57,28 @@ def _parse_iso(value: object) -> datetime | None:
         return None
 
 
-def _select_run(runs: list[dict], head_sha: str | None, since: datetime, workflow_name: str) -> dict | None:
+def _select_run(
+    runs: list[dict],
+    head_sha: str | None,
+    since: datetime,
+    workflow_name: str,
+    head_branch: str = ROLLING_PATCH_BRANCH,
+) -> dict | None:
     """Find the fix branch's CI run for this patch.
 
     Prefer an exact head_sha match (precise). Otherwise fall back to the most
     recent run on the fix branch created at/after `since` — this covers GitHub
     associating a pull_request run with a sha other than the branch tip.
+
+    `head_branch` defaults to the CI rolling branch; the chat path passes its
+    per-turn branch (agent/chat-<turn>) so a chat PR's run is matched, not the
+    auto-fix PR's.
     """
     branch_runs = [
         r
         for r in runs
         if isinstance(r, dict)
-        and r.get("head_branch") == ROLLING_PATCH_BRANCH
+        and r.get("head_branch") == head_branch
         and (not workflow_name or r.get("name") == workflow_name)
     ]
     if head_sha:
@@ -100,9 +110,13 @@ async def verify_patch_ci(
     event: WorkflowFailureEvent,
     mcp_client: GitHubMCPClient,
     settings: Settings,
+    head_branch: str = ROLLING_PATCH_BRANCH,
 ) -> VerifyResult:
     """Block until the fix PR's CI reaches a verdict, the run can't be found,
-    or the configured timeout expires. Never raises."""
+    or the configured timeout expires. Never raises.
+
+    `head_branch` selects which branch's runs to watch — defaults to the CI
+    rolling branch; the chat path passes its per-turn branch."""
     workflow_name = event.workflow_name or ""
     head_sha = patch_result.head_sha
     since = datetime.now(timezone.utc)
@@ -120,7 +134,7 @@ async def verify_patch_ci(
             logger.info("ci_verifier: list runs failed (will retry): %s", e)
             runs = []
 
-        run = _select_run(runs, head_sha, since, workflow_name)
+        run = _select_run(runs, head_sha, since, workflow_name, head_branch)
         if run is not None:
             seen_run = True
             status = run.get("status")
