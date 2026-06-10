@@ -37,8 +37,12 @@ def disabled_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "fake")
     monkeypatch.setenv("GITHUB_REPO_OWNER", "test")
     monkeypatch.setenv("GITHUB_REPO_NAME", "demo")
-    monkeypatch.delenv("BACKEND_BASE_URL", raising=False)
-    monkeypatch.delenv("AGENT_SHARED_SECRET", raising=False)
+    # setenv("") not delenv: get_settings() loads via load_dotenv(), which would
+    # otherwise repopulate these from the developer's real .env and falsely enable
+    # the channel this test asserts is disabled. An explicit empty value wins over
+    # the dotenv file. See reference_cd_test_isolation_dotenv.
+    monkeypatch.setenv("BACKEND_BASE_URL", "")
+    monkeypatch.setenv("AGENT_SHARED_SECRET", "")
     yield
     settings_module.get_settings.cache_clear()
 

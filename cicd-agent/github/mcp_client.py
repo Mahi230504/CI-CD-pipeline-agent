@@ -65,27 +65,50 @@ class GitHubMCPClient:
         self._stack: AsyncExitStack | None = None
         self._repo_owner: str = ""
         self._repo_name: str = ""
+        # Hard timeouts so a stalled GitHub edge can never hang the pipeline.
+        # Real values are read from settings in __aenter__; these conservative
+        # defaults apply even if a tool is somehow called before that.
+        self._call_timeout: float = 45.0
+        self._connect_timeout: float = 30.0
 
     async def __aenter__(self) -> "GitHubMCPClient":
         settings = get_settings()
         self._repo_owner = settings.github_repo_owner
         self._repo_name = settings.github_repo_name
+        # Honour any positive override; fall back to the safe default for a
+        # zero / negative / unset value (a non-positive timeout would fire
+        # instantly and break every call).
+        self._call_timeout = max(0.0, float(settings.mcp_call_timeout_seconds)) or 45.0
+        self._connect_timeout = max(0.0, float(settings.mcp_connect_timeout_seconds)) or 30.0
 
         self._stack = AsyncExitStack()
         await self._stack.__aenter__()
         try:
-            transport = await self._stack.enter_async_context(
-                streamablehttp_client(
-                    settings.github_mcp_url,
-                    headers=settings.github_mcp_headers,
+            # Bound the whole connect handshake — a dead/slow MCP edge must fail
+            # fast here rather than hang before the pipeline's first phase.
+            async with asyncio.timeout(self._connect_timeout):
+                transport = await self._stack.enter_async_context(
+                    streamablehttp_client(
+                        settings.github_mcp_url,
+                        headers=settings.github_mcp_headers,
+                    )
                 )
-            )
-            read_stream, write_stream, _ = transport
-            self._session = await self._stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
-            await self._session.initialize()
+                read_stream, write_stream, _ = transport
+                self._session = await self._stack.enter_async_context(
+                    ClientSession(read_stream, write_stream)
+                )
+                await self._session.initialize()
             logger.info("GitHub MCP session initialised for %s/%s", self._repo_owner, self._repo_name)
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            await self._stack.__aexit__(type(e), e, e.__traceback__)
+            self._stack = None
+            self._session = None
+            logger.error("GitHub MCP connect timed out after %.0fs", self._connect_timeout)
+            raise GitHubMCPError(
+                f"GitHub MCP connect timed out after {self._connect_timeout:.0f}s",
+                tool_name="__connect__",
+                original=e if isinstance(e, Exception) else None,
+            ) from e
         except Exception:
             await self._stack.__aexit__(None, None, None)
             self._stack = None
@@ -112,7 +135,22 @@ class GitHubMCPClient:
         # Log the call (arg keys only — values can contain large file contents / secrets).
         logger.info("mcp call: %s args=%s", tool_name, sorted(arguments.keys()))
         try:
-            result = await self.session.call_tool(tool_name, arguments)
+            # Hard per-call timeout: the streamable-HTTP MCP transport has no
+            # deadline of its own, so a stalled GitHub edge would otherwise hang
+            # this await indefinitely (the pipeline freeze we saw at the
+            # flakiness check). On expiry we surface a normal GitHubMCPError so
+            # callers degrade gracefully instead of blocking.
+            result = await asyncio.wait_for(
+                self.session.call_tool(tool_name, arguments),
+                timeout=self._call_timeout,
+            )
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            logger.error("mcp tool %s timed out after %.0fs", tool_name, self._call_timeout)
+            raise GitHubMCPError(
+                f"MCP tool {tool_name} timed out after {self._call_timeout:.0f}s",
+                tool_name=tool_name,
+                original=e if isinstance(e, Exception) else None,
+            ) from e
         except GitHubMCPError:
             raise
         except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):

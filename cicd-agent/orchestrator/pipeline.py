@@ -20,12 +20,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Awaitable, TypeVar
 
 from agents import event_publisher
 from audit.context import clear_run_context, set_run_context
 from audit.logger import audit_step, get_audit_logger
-from config.constants import ROLLING_PATCH_BRANCH, PipelineStep, TaskState
+from config.constants import ROLLING_PATCH_BRANCH, ErrorCategory, PipelineStep, TaskState
 from config.settings import Settings, get_settings
 from github import rest_api
 from github.log_fetcher import fetch_job_logs
@@ -34,10 +34,12 @@ from github.run_history import clear_cache
 from metrics import active_runs, record_pipeline
 from models.events import WorkflowFailureEvent
 from models.run import PatchResult
-from models.task import AgentTask, NotificationPayload
+from models.task import AgentTask, FlakinessVerdict, NotificationPayload
 from orchestrator.run_registry import get_registry
 
 logger = logging.getLogger("cicd_agent.pipeline")
+
+T = TypeVar("T")
 
 
 async def _publish(
@@ -64,6 +66,43 @@ async def _publish(
     if meta:
         base.update(meta)
     await event_publisher.publish_safe(stage, message, level=level, metadata=base)  # type: ignore[arg-type]
+
+
+def _verify_budget(settings: Settings) -> int:
+    """Extra time the patch phase may legitimately spend waiting on the fix PR's
+    live CI, on top of the base session budget. Each verify iteration polls one
+    CI run to completion. Shared by the outer pipeline timeout and the patch
+    phase ceiling so the two never disagree."""
+    if not settings.patch_verify_enabled:
+        return 0
+    return settings.patch_verify_timeout_seconds * (settings.patch_verify_max_iterations + 1)
+
+
+async def _run_phase(
+    coro: Awaitable[T],
+    *,
+    timeout: float,
+    fallback: T,
+    label: str,
+    event: WorkflowFailureEvent,
+    stage: str,
+    timeout_message: str,
+) -> T:
+    """Run one pipeline phase under a hard timeout, degrading instead of hanging.
+
+    The per-call MCP and LLM timeouts already bound every *known* network await;
+    this is the belt-and-suspenders layer that keeps the pipeline moving even if
+    some await we didn't anticipate stalls. On expiry the phase coroutine is
+    cancelled, a warning is surfaced to the dashboard, and `fallback` is returned
+    so the orchestrator continues down a safe path (escalate / skip / proceed).
+    This is what makes "never get stuck anywhere, whatever the reason" hold."""
+    try:
+        async with asyncio.timeout(timeout):
+            return await coro
+    except asyncio.TimeoutError:
+        logger.error("phase %s exceeded %.0fs — degrading to fallback", label, timeout)
+        await _publish(event, stage, timeout_message, level="warn")
+        return fallback
 
 
 def _pipeline_outcome(task: AgentTask) -> str:
@@ -103,12 +142,7 @@ async def run_pipeline(event: WorkflowFailureEvent) -> None:
     # Patch verification waits on the fix PR's live CI run, which legitimately
     # takes minutes — so it gets its own budget ON TOP of the base session
     # timeout, or the timeout would kill the pipeline mid-verify.
-    verify_budget = (
-        settings.patch_verify_timeout_seconds * (settings.patch_verify_max_iterations + 1)
-        if settings.patch_verify_enabled
-        else 0
-    )
-    effective_timeout = settings.session_timeout_seconds + verify_budget
+    effective_timeout = settings.session_timeout_seconds + _verify_budget(settings)
 
     try:
         async with asyncio.timeout(effective_timeout):
@@ -220,7 +254,15 @@ async def _execute_pipeline(
         # ── Step 2: Fetch logs ─────────────────────────────────────────────
         async with audit_step(event.run_id, "fetch_logs"):
             await _publish(event, "fetch_logs", "Fetching failed-job logs from GitHub…")
-            job_logs = await fetch_job_logs(event.run_id, mcp)
+            job_logs = await _run_phase(
+                fetch_job_logs(event.run_id, mcp),
+                timeout=settings.phase_timeout_seconds,
+                fallback=[],
+                label="fetch_logs",
+                event=event,
+                stage="fetch_logs",
+                timeout_message="Log fetch timed out — escalating to a human",
+            )
             if not job_logs:
                 await _publish(
                     event,
@@ -246,7 +288,22 @@ async def _execute_pipeline(
             await _publish(
                 event, "flakiness", "Checking whether this failure is flaky or genuine…"
             )
-            verdict = await flakiness_check(event, job_logs, mcp)
+            verdict = await _run_phase(
+                flakiness_check(event, job_logs, mcp),
+                timeout=settings.phase_timeout_seconds,
+                # Degrade toward action: if we can't decide flakiness in time,
+                # treat it as a real failure and go fix it rather than skip.
+                fallback=FlakinessVerdict(
+                    is_flaky=False,
+                    reason="flakiness check timed out — treating as a real failure",
+                    pass_rate=0.0,
+                    error_category=ErrorCategory.CODE_BUG,
+                ),
+                label="flakiness",
+                event=event,
+                stage="flakiness",
+                timeout_message="Flakiness check timed out — proceeding to fix the failure",
+            )
             task.flakiness_verdict = verdict
             task.mark_step_done(PipelineStep.FLAKINESS_CHECK)
 
@@ -276,7 +333,15 @@ async def _execute_pipeline(
             await _publish(
                 event, "diagnosis", "Analysing logs with Gemini to find the root cause…"
             )
-            diagnosis = await diagnose(job_logs, event, mcp_client=mcp)
+            diagnosis = await _run_phase(
+                diagnose(job_logs, event, mcp_client=mcp),
+                timeout=settings.phase_timeout_seconds,
+                fallback=None,
+                label="diagnosis",
+                event=event,
+                stage="diagnosis",
+                timeout_message="Root-cause analysis timed out — escalating to a human",
+            )
             task.diagnosis = diagnosis
             if diagnosis is not None:
                 etype = getattr(diagnosis.error_type, "value", str(diagnosis.error_type))
@@ -410,12 +475,29 @@ async def _execute_pipeline(
                 if target_log is not None
                 else (job_logs[0].raw_log[:8000] if job_logs else None)
             )
-            patch_result = await do_patch(
-                diagnosis=diagnosis,
+            # The patch phase opens the PR AND waits on its live CI, so it gets
+            # the verify budget on top of the generic phase ceiling. It can never
+            # run away: verify has its own internal deadline and every MCP call
+            # is bounded — this is the final backstop.
+            patch_result = await _run_phase(
+                do_patch(
+                    diagnosis=diagnosis,
+                    event=event,
+                    attempt_number=attempt_count + 1,
+                    mcp_client=mcp,
+                    failing_log=failing_log,
+                ),
+                timeout=_verify_budget(settings) + settings.phase_timeout_seconds,
+                fallback=PatchResult(
+                    branch_name="",
+                    success=False,
+                    attempt_number=attempt_count + 1,
+                    error_message="patch phase timed out",
+                ),
+                label="code_patch",
                 event=event,
-                attempt_number=attempt_count + 1,
-                mcp_client=mcp,
-                failing_log=failing_log,
+                stage="code_patch",
+                timeout_message="Patch + verify exceeded its time budget — needs human review",
             )
             task.patch_result = patch_result
             if patch_result.success and isinstance(patch_result.pr_number, int):
@@ -470,7 +552,15 @@ async def _execute_pipeline(
             await _publish(
                 event, "yaml_optimize", "Optimising the workflow YAML for faster CI runs…"
             )
-            opt_result = await optimize(event, mcp)
+            opt_result = await _run_phase(
+                optimize(event, mcp),
+                timeout=settings.phase_timeout_seconds,
+                fallback=None,
+                label="yaml_optimize",
+                event=event,
+                stage="yaml_optimize",
+                timeout_message="Workflow optimization timed out — skipping (optional step)",
+            )
             task.optimization_result = opt_result
             if opt_result is not None and opt_result.pr_number:
                 await _publish(
@@ -513,12 +603,26 @@ async def _send_notification(task: AgentTask, start_time: float) -> None:
             escalated=base.escalated,
             escalation_reason=base.escalation_reason,
         )
-        task.notification_sent = await notify(payload)
-        if task.event is not None:
+        # Bound the send: notify() is internally bounded, but _send_notification
+        # also runs inside the timeout / fatal handlers, so a hang here would
+        # re-freeze a run we were already trying to wind down.
+        ev = task.event
+        if ev is not None:
+            task.notification_sent = await _run_phase(
+                notify(payload),
+                timeout=get_settings().phase_timeout_seconds,
+                fallback=False,
+                label="notify",
+                event=ev,
+                stage="notify",
+                timeout_message="Notification timed out",
+            )
             await _publish(
-                task.event,
+                ev,
                 "notify",
                 "Notification sent" if task.notification_sent else "Notification could not be sent",
                 level="info" if task.notification_sent else "warn",
             )
+        else:
+            task.notification_sent = await notify(payload)
         task.mark_step_done(PipelineStep.NOTIFY)

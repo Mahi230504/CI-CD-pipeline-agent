@@ -37,6 +37,23 @@ class Settings:
     max_patch_attempts: int = 2
     session_timeout_seconds: int = 180
     max_loop_iterations: int = 30
+    # ── Resilience: hard timeouts so no single call or phase can hang a run ──
+    # Every GitHub MCP tool call is bounded by this; on expiry it raises a
+    # GitHubMCPError that callers already degrade gracefully. This is the guard
+    # that stops the pipeline freezing on a stalled GitHub edge — the classic
+    # "stuck at the flakiness check" hang, where list_workflow_runs never
+    # returned and only the multi-minute outer budget could break it.
+    mcp_call_timeout_seconds: int = 45
+    # Bound on establishing the MCP session at pipeline start, so a dead edge
+    # fails fast instead of hanging before the first phase even begins.
+    mcp_connect_timeout_seconds: int = 30
+    # Per-phase ceiling in the orchestrator. If any phase (flakiness, diagnosis,
+    # optimize, notify) exceeds this it is abandoned and the pipeline degrades to
+    # a safe default rather than blocking. Belt-and-suspenders on top of the
+    # per-call timeouts: guarantees forward progress even if some await we didn't
+    # anticipate hangs. The patch phase gets a larger budget derived from the
+    # verify settings (it legitimately waits on the fix PR's live CI).
+    phase_timeout_seconds: int = 150
     # Minimum seconds between LLM calls. OpenRouter is paid, so a small courtesy
     # gap is enough; the free-tier 7s gap is no longer needed.
     rate_limit_delay_seconds: float = 0.5
@@ -232,6 +249,9 @@ def get_settings() -> Settings:
         max_patch_attempts=_int_env("MAX_PATCH_ATTEMPTS", 2),
         session_timeout_seconds=_int_env("SESSION_TIMEOUT_SECONDS", 180),
         max_loop_iterations=_int_env("MAX_LOOP_ITERATIONS", 30),
+        mcp_call_timeout_seconds=_int_env("MCP_CALL_TIMEOUT_SECONDS", 45),
+        mcp_connect_timeout_seconds=_int_env("MCP_CONNECT_TIMEOUT_SECONDS", 30),
+        phase_timeout_seconds=_int_env("PHASE_TIMEOUT_SECONDS", 150),
         rate_limit_delay_seconds=_float_env("RATE_LIMIT_DELAY_SECONDS", 0.5),
         webhook_port=_int_env("WEBHOOK_PORT", 8000),
         log_dir=_optional("LOG_DIR", "./logs"),
